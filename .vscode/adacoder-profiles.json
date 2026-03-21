@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "activeProfileId": "default",
+  "profiles": [
+    {
+      "id": "default",
+      "name": "Default",
+      "baseUrl": "",
+      "model": "gpt-5.4",
+      "provider": "other",
+      "apiKey": ""
+    }
+  ]
+}

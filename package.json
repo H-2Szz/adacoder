@@ -1,0 +1,120 @@
+{
+  "name": "adacoder",
+  "displayName": "Adacoder",
+  "description": "adcoder",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.110.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:adacoder.openChat",
+    "onCommand:adacoder.openSettings",
+    "onCommand:adacoder.openProfileConfig",
+    "onCommand:adacoder.runWorkflow",
+    "onCommand:adacoder.runFromSelection",
+    "onView:adacoder.sidebarView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "adacoder.openChat",
+        "title": "Adacoder: Open Chat"
+      },
+      {
+        "command": "adacoder.openSettings",
+        "title": "Adacoder: Open Settings"
+      },
+      {
+        "command": "adacoder.openProfileConfig",
+        "title": "Adacoder: Open Profile Config File"
+      },
+      {
+        "command": "adacoder.runWorkflow",
+        "title": "Adacoder: Open Chat (Legacy Command)"
+      },
+      {
+        "command": "adacoder.runFromSelection",
+        "title": "Adacoder: Generate From Selection"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "adacoder.runFromSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@100"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "adacoder-sidebar",
+          "title": "Adacoder",
+          "icon": "media/adacoder.svg"
+        }
+      ]
+    },
+    "views": {
+      "adacoder-sidebar": [
+        {
+          "id": "adacoder.sidebarView",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Adacoder",
+      "properties": {
+        "adacoder.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python executable. Supports command (python3), absolute path, relative path, ${workspaceFolder} and ${extensionPath}."
+        },
+        "adacoder.bridgePath": {
+          "type": "string",
+          "default": "backend/bridge.py",
+          "description": "Path to bridge.py. Supports absolute path, relative path, ${workspaceFolder} and ${extensionPath}."
+        },
+        "adacoder.profileConfigPath": {
+          "type": "string",
+          "default": ".vscode/adacoder-profiles.json",
+          "description": "Path to profile JSON config file. Supports absolute path, relative path, ${workspaceFolder} and ${extensionPath}."
+        },
+        "adacoder.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Default LLM base_url sent to backend."
+        },
+        "adacoder.model": {
+          "type": "string",
+          "default": "gpt-5.4",
+          "description": "Default model name sent to backend."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.110.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "typescript-eslint": "^8.56.1",
+    "eslint": "^9.39.3",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}
