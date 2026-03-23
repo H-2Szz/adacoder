@@ -23,7 +23,11 @@ class Adacoder:
         code=self.coder.execute_coder(problem_statement=problem_statement)# 默认请求10次直到成功，没成功也没办法
         if not code:
             # 尝试没成功(默认10次)
-            raise(RuntimeError("尝试连接LLM失败"))
+            # raise(RuntimeError("尝试连接LLM失败"))
+            return {
+                "passed":False,
+                "error":"Try to get the return code, but something happen and stop it. May be check your llm config or try again."
+            }
         # 开始代码测试
         code_test_res=self.coder.evaluate_code(code=code,test_path=test_file_path)
         if code_test_res.get("passed",False):

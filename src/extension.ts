@@ -30,11 +30,6 @@ type WorkflowResult = {
 
 type BridgeLogLevel = 'runtime' | 'stdout' | 'stderr' | 'info' | 'error';
 
-interface BridgeLogEvent {
-	level: BridgeLogLevel;
-	text: string;
-}
-
 interface RunRequest {
 	problem: string;
 	testFilePath: string;
@@ -387,8 +382,6 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 
 		this.running = true;
 		this.postMessage({ type: 'runState', running: true });
-		this.appendUiLog('info', `Running with profile: ${profile.name}`);
-		this.appendUiLog('info', `test_file_path: ${testFilePath}`);
 
 		try {
 			const args: WorkflowArgs = {
@@ -400,29 +393,34 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 				test_file_path: testFilePath
 			};
 
-			const response = await invokeBridge(context, args, this.outputChannel, (event) => {
-				this.appendUiLog(event.level, event.text);
-			});
+			const response = await invokeBridge(context, args, this.outputChannel);
 
 			if (!response.ok) {
 				const detail = response.traceback ? `\n${response.traceback}` : '';
-				this.appendUiLog('error', `Backend error: ${response.error ?? 'Unknown error'}${detail}`);
+				this.postMessage({
+					type: 'workflowError',
+					reason: `Backend error: ${response.error ?? 'Unknown error'}${detail}`
+				});
 				return;
 			}
 
 			const result = response.result as WorkflowResult | undefined;
 			const passed = Boolean(result?.passed);
 			const generatedCode = typeof result?.code === 'string' ? result.code : '';
+			const failureReason = passed ? '' : extractFailureReason(result);
 			this.postMessage({
 				type: 'workflowResult',
 				passed,
 				result,
-				code: generatedCode
+				code: passed ? generatedCode : '',
+				failureReason
 			});
-			this.appendUiLog('info', passed ? 'Workflow completed and tests passed.' : 'Workflow completed but tests failed.');
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			this.appendUiLog('error', `Execution failed: ${message}`);
+			this.postMessage({
+				type: 'workflowError',
+				reason: `Execution failed: ${message}`
+			});
 		} finally {
 			this.running = false;
 			this.postMessage({ type: 'runState', running: false });
@@ -560,10 +558,7 @@ export function activate(context: vscode.ExtensionContext) {
 		panel.showTaskPage();
 		panel.prefillProblem(selection);
 		panel.setTestPath(testFilePath);
-		await panel.runWorkflow(context, {
-			problem: selection,
-			testFilePath
-		});
+		void vscode.window.showInformationMessage('Test file selected. Click "Run Workflow" to start.');
 	});
 
 	context.subscriptions.push(
@@ -723,6 +718,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null;
 }
 
+function extractFailureReason(result: WorkflowResult | undefined): string {
+	if (!result || !isRecord(result)) {
+		return 'Workflow failed without a detailed reason.';
+	}
+
+	const candidateKeys = [
+		'error',
+		'reason',
+		'message',
+		'failureReason',
+		'failure_reason',
+		'stderr',
+		'traceback'
+	];
+
+	for (const key of candidateKeys) {
+		const value = result[key];
+		if (typeof value === 'string' && value.trim()) {
+			return value.trim();
+		}
+	}
+
+	return 'Workflow failed without a detailed reason.';
+}
+
 function getWorkspaceRootPath(): string | undefined {
 	return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
@@ -814,8 +834,7 @@ function resolvePythonPath(context: vscode.ExtensionContext): string {
 function invokeBridge(
 	context: vscode.ExtensionContext,
 	args: WorkflowArgs,
-	outputChannel: vscode.OutputChannel,
-	onLog: (event: BridgeLogEvent) => void
+	outputChannel: vscode.OutputChannel
 ): Promise<BridgeResponse> {
 	return new Promise((resolve, reject) => {
 		const bridgePath = resolveBridgePath(context);
@@ -832,8 +851,8 @@ function invokeBridge(
 			args
 		};
 
-		onLog({ level: 'runtime', text: `python=${pythonPath}` });
-		onLog({ level: 'runtime', text: `bridge=${bridgePath}` });
+		outputChannel.appendLine(`[runtime] python=${pythonPath}`);
+		outputChannel.appendLine(`[runtime] bridge=${bridgePath}`);
 		outputChannel.appendLine(`[request] ${JSON.stringify(request, null, 2)}`);
 
 		const child = spawn(pythonPath, [bridgePath], {
@@ -864,7 +883,6 @@ function invokeBridge(
 				return;
 			}
 			outputChannel.appendLine(`[stderr] ${text}`);
-			onLog({ level: 'stderr', text });
 		});
 
 		child.on('error', (error: Error) => {
@@ -894,7 +912,6 @@ function invokeBridge(
 			try {
 				const parsed = JSON.parse(line) as BridgeResponse;
 				if (parsed.id !== requestId && parsed.id !== null) {
-					onLog({ level: 'stdout', text: line });
 					return;
 				}
 				if (settled) {
@@ -905,7 +922,7 @@ function invokeBridge(
 				child.stdin.end();
 				resolve(parsed);
 			} catch {
-				onLog({ level: 'stdout', text: line });
+				// Non-JSON stdout is already written to the output channel.
 			}
 		});
 
@@ -1047,38 +1064,149 @@ function getChatHtml(webview: vscode.Webview): string {
     .actions { display: flex; justify-content: flex-end; gap: 8px; }
     .status { font-size: 12px; color: var(--muted); }
     .logs {
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 10px;
+      border: none;
+      border-radius: 0;
+      padding: 8px 6px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 12px;
       max-height: 360px;
       overflow: auto;
     }
     .log {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 7px 9px;
-      font-size: 12px;
+      border: none;
+      border-radius: 0;
+      padding: 0;
+      font-size: 13px;
       white-space: pre-wrap;
       word-break: break-word;
-      line-height: 1.4;
+      line-height: 1.55;
+      background: transparent;
     }
     .log.runtime { color: var(--muted); }
-    .log.stderr, .log.error { border-color: var(--error); color: var(--error); }
-    .log.result-pass { border-color: var(--ok); }
-    .log.result-fail { border-color: var(--warn); }
-    .hint { font-size: 12px; color: var(--muted); }
-    pre {
-      margin: 8px 0 0;
+    .log.loading { color: var(--muted); font-style: italic; }
+    .log.stderr, .log.error, .log.result-fail { color: var(--error); }
+    .log.result-pass { color: var(--fg); }
+    .log.code-block { color: var(--fg); }
+    .log.user-request { color: var(--fg); }
+    .log .md-paragraph { margin: 0; }
+    .log .md-heading { font-weight: 600; margin: 0; }
+    .log .md-heading.md-h1 { font-size: 15px; }
+    .log .md-heading.md-h2 { font-size: 14px; }
+    .log .md-heading.md-h3 { font-size: 13px; }
+    .log ul { margin: 2px 0 0 18px; padding: 0; }
+    .log li { margin: 2px 0; }
+    .log code { background: var(--input-bg); padding: 1px 4px; border-radius: 4px; }
+    .md-divider { border-top: 1px solid var(--border); margin: 4px 0; }
+    .task-separator {
+      display: flex;
+      align-items: center;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      gap: 10px;
+      margin: 10px 0 6px;
+    }
+    .task-separator::before,
+    .task-separator::after {
+      content: '';
+      flex: 1;
+      border-top: 1px dashed var(--border);
+    }
+    .task-separator span {
+      white-space: nowrap;
+      padding: 2px 8px;
       border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 8px;
-      overflow: auto;
-      max-height: 220px;
+      border-radius: 999px;
       background: var(--input-bg);
     }
+    .hint { font-size: 12px; color: var(--muted); }
+    pre {
+      margin: 6px 0 0;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px;
+      overflow: auto;
+      max-height: 260px;
+      background: var(--input-bg);
+    }
+    .task-page {
+      padding: 0;
+      gap: 0;
+      overflow: hidden;
+      height: calc(100vh - 92px);
+    }
+    .task-toolbar {
+      border-bottom: 1px solid var(--border);
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: var(--bg);
+    }
+    .task-toolbar-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .task-toolbar-row label {
+      min-width: 68px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .task-toolbar-row .path-row {
+      flex: 1;
+    }
+    .chat-stream {
+      flex: 1;
+      min-height: 0;
+      max-height: none;
+      margin: 12px;
+      border-radius: 10px;
+    }
+    .composer {
+      border-top: 1px solid var(--border);
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: var(--bg);
+    }
+    .composer textarea {
+      min-height: 96px;
+      max-height: 220px;
+    }
+    .composer-path-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .composer-path-row input {
+      flex: 1;
+    }
+    .composer-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .composer-actions .actions {
+      margin-left: auto;
+    }
+    pre code {
+      display: block;
+      font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre;
+    }
+    .hl-comment { color: var(--vscode-descriptionForeground, #6a9955); }
+    .hl-string { color: var(--vscode-debugTokenExpression-string, #ce9178); }
+    .hl-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); }
+    .hl-builtin { color: var(--vscode-symbolIcon-functionForeground, #4ec9b0); }
+    .hl-number { color: var(--vscode-symbolIcon-numberForeground, #b5cea8); }
+    .hl-function { color: var(--vscode-symbolIcon-methodForeground, #dcdcaa); }
   </style>
 </head>
 <body>
@@ -1094,29 +1222,32 @@ function getChatHtml(webview: vscode.Webview): string {
     <button id="settingsTabBtn" class="tab-btn">Settings</button>
   </div>
 
-  <div id="taskPage" class="page active">
-    <div class="section">
-      <div class="row">
+  <div id="taskPage" class="page active task-page">
+    <div class="task-toolbar">
+      <div class="task-toolbar-row">
         <label for="taskProfileSelect">Profile</label>
         <select id="taskProfileSelect"></select>
         <button id="newProfileFromTaskBtn" class="ghost">Add</button>
       </div>
 
-      <textarea id="problemInput" placeholder="Describe the problem here..."></textarea>
+    </div>
 
-      <div class="path-row">
+    <div id="logs" class="logs chat-stream"></div>
+
+    <div class="composer">
+      <textarea id="problemInput" placeholder="Ask anything about your code..."></textarea>
+      <div class="composer-path-row">
         <input id="testPathInput" placeholder="test_file_path" />
         <button id="pickTestPathBtn" class="ghost">Browse</button>
       </div>
-
-      <div class="actions">
-        <button id="useSelectionBtn" class="ghost">Use Selection</button>
-        <button id="runBtn">Run Workflow</button>
+      <div class="composer-actions">
+        <div id="statusText" class="status">Idle</div>
+        <div class="actions">
+          <button id="useSelectionBtn" class="ghost">Use Selection</button>
+          <button id="runBtn">Run Workflow</button>
+        </div>
       </div>
-      <div id="statusText" class="status">Idle</div>
     </div>
-
-    <div id="logs" class="logs"></div>
   </div>
 
   <div id="settingsPage" class="page">
@@ -1195,7 +1326,10 @@ function getChatHtml(webview: vscode.Webview): string {
       activeProfileId: '',
       editingProfileId: '',
       running: false,
-      returnToTaskAfterSave: false
+      returnToTaskAfterSave: false,
+      loadingLog: null,
+      taskCounter: 0,
+      pendingTaskRequest: ''
     };
 
     const switchPage = (page) => {
@@ -1211,16 +1345,358 @@ function getChatHtml(webview: vscode.Webview): string {
     const addLog = (text, className = 'info') => {
       const div = document.createElement('div');
       div.className = 'log ' + className;
-      div.textContent = text;
+      div.appendChild(renderMarkdownToFragment(text));
       logs.appendChild(div);
       logs.scrollTop = logs.scrollHeight;
       return div;
     };
 
+    const addTaskSeparator = (taskNumber) => {
+      const separator = document.createElement('div');
+      separator.className = 'task-separator';
+      const label = document.createElement('span');
+      label.textContent = 'Task ' + taskNumber;
+      separator.appendChild(label);
+      logs.appendChild(separator);
+      logs.scrollTop = logs.scrollHeight;
+    };
+
+    const escapeHtml = (value) => String(value)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+
+    const PYTHON_KEYWORDS = new Set([
+      'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue',
+      'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in',
+      'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield'
+    ]);
+
+    const PYTHON_BUILTINS = new Set([
+      'int', 'str', 'list', 'dict', 'set', 'tuple', 'float', 'bool', 'len', 'range', 'print',
+      'enumerate', 'zip', 'map', 'filter', 'open', 'sum', 'min', 'max', 'any', 'all', 'type', 'isinstance'
+    ]);
+
+    const tokenizePython = (code) => {
+      const tokenRegex = /("""[\\s\\S]*?"""|'''[\\s\\S]*?'''|"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|#[^\\n]*|\\b[A-Za-z_][A-Za-z0-9_]*\\b|\\b\\d+(?:\\.\\d+)?\\b)/g;
+      let out = '';
+      let last = 0;
+      for (const match of code.matchAll(tokenRegex)) {
+        const token = match[0];
+        const index = match.index ?? 0;
+        out += escapeHtml(code.slice(last, index));
+
+        if (token.startsWith('#')) {
+          out += '<span class="hl-comment">' + escapeHtml(token) + '</span>';
+        } else if (token.startsWith('"') || token.startsWith("'") ) {
+          out += '<span class="hl-string">' + escapeHtml(token) + '</span>';
+        } else if (/^\\d/.test(token)) {
+          out += '<span class="hl-number">' + escapeHtml(token) + '</span>';
+        } else if (PYTHON_KEYWORDS.has(token)) {
+          out += '<span class="hl-keyword">' + escapeHtml(token) + '</span>';
+        } else if (PYTHON_BUILTINS.has(token)) {
+          out += '<span class="hl-builtin">' + escapeHtml(token) + '</span>';
+        } else {
+          const rest = code.slice(index + token.length);
+          const isFunction = /^\\s*\\(/.test(rest);
+          if (isFunction) {
+            out += '<span class="hl-function">' + escapeHtml(token) + '</span>';
+          } else {
+            out += escapeHtml(token);
+          }
+        }
+
+        last = index + token.length;
+      }
+
+      out += escapeHtml(code.slice(last));
+      return out;
+    };
+
+    const createCodeBlockElement = (code, language = 'python') => {
+      const pre = document.createElement('pre');
+      const codeEl = document.createElement('code');
+      const lang = String(language || '').toLowerCase();
+
+      if (lang === 'python' || lang === 'py' || lang === '') {
+        codeEl.className = 'language-python';
+        codeEl.innerHTML = tokenizePython(code);
+      } else {
+        codeEl.className = 'language-' + lang;
+        codeEl.textContent = code;
+      }
+
+      pre.appendChild(codeEl);
+      return pre;
+    };
+
+    const mdFence = String.fromCharCode(96).repeat(3);
+
+    const renderInlineMarkdown = (text) => {
+      const escaped = escapeHtml(text);
+      return escaped;
+    };
+
+    const renderMarkdownToFragment = (markdown) => {
+      const fragment = document.createDocumentFragment();
+      const lines = String(markdown ?? '').replaceAll('\\r\\n', '\\n').split('\\n');
+      let paragraph = [];
+
+      const flushParagraph = () => {
+        if (paragraph.length === 0) {
+          return;
+        }
+        const div = document.createElement('div');
+        div.className = 'md-paragraph';
+        div.innerHTML = renderInlineMarkdown(paragraph.join(' '));
+        fragment.appendChild(div);
+        paragraph = [];
+      };
+
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        const trimmed = line.trim();
+
+        if (trimmed.startsWith(mdFence)) {
+          flushParagraph();
+          const language = trimmed.slice(3).trim();
+          const codeLines = [];
+          i += 1;
+          while (i < lines.length && !lines[i].trim().startsWith(mdFence)) {
+            codeLines.push(lines[i]);
+            i += 1;
+          }
+          fragment.appendChild(createCodeBlockElement(codeLines.join('\\n'), language));
+          continue;
+        }
+
+        if (!trimmed) {
+          flushParagraph();
+          continue;
+        }
+
+        if (trimmed === '---' || trimmed === '***') {
+          flushParagraph();
+          const divider = document.createElement('div');
+          divider.className = 'md-divider';
+          fragment.appendChild(divider);
+          continue;
+        }
+
+        if (trimmed.startsWith('### ')) {
+          flushParagraph();
+          const heading = document.createElement('div');
+          heading.className = 'md-heading md-h3';
+          heading.innerHTML = renderInlineMarkdown(trimmed.slice(4));
+          fragment.appendChild(heading);
+          continue;
+        }
+
+        if (trimmed.startsWith('## ')) {
+          flushParagraph();
+          const heading = document.createElement('div');
+          heading.className = 'md-heading md-h2';
+          heading.innerHTML = renderInlineMarkdown(trimmed.slice(3));
+          fragment.appendChild(heading);
+          continue;
+        }
+
+        if (trimmed.startsWith('# ')) {
+          flushParagraph();
+          const heading = document.createElement('div');
+          heading.className = 'md-heading md-h1';
+          heading.innerHTML = renderInlineMarkdown(trimmed.slice(2));
+          fragment.appendChild(heading);
+          continue;
+        }
+
+        if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+          flushParagraph();
+          const list = document.createElement('ul');
+          while (i < lines.length) {
+            const current = lines[i].trim();
+            if (!(current.startsWith('- ') || current.startsWith('* '))) {
+              break;
+            }
+            const item = document.createElement('li');
+            item.innerHTML = renderInlineMarkdown(current.slice(2));
+            list.appendChild(item);
+            i += 1;
+          }
+          i -= 1;
+          fragment.appendChild(list);
+          continue;
+        }
+
+        paragraph.push(trimmed);
+      }
+
+      flushParagraph();
+
+      if (fragment.childNodes.length === 0) {
+        const fallback = document.createElement('div');
+        fallback.className = 'md-paragraph';
+        fallback.textContent = '';
+        fragment.appendChild(fallback);
+      }
+
+      return fragment;
+    };
+
+    const appendCodeBlock = (card, code, language = 'python') => {
+      card.appendChild(createCodeBlockElement(code, language));
+    };
+
+    const showLoading = () => {
+      if (state.loadingLog) {
+        return;
+      }
+      state.loadingLog = addLog('Loading...', 'loading');
+    };
+
+    const hideLoading = () => {
+      if (!state.loadingLog) {
+        return;
+      }
+      state.loadingLog.remove();
+      state.loadingLog = null;
+    };
+
+    const clearTaskInputs = () => {
+      problemInput.value = '';
+      testPathInput.value = '';
+    };
+
+    const pushField = (parts, label, value) => {
+      if (value === undefined || value === null) {
+        return;
+      }
+      const text = String(value).trim();
+      if (!text || text === 'null' || text === 'undefined') {
+        return;
+      }
+      parts.push(label + ': ' + text);
+    };
+
+    const formatTaskRequest = (problem, testFilePath, profileId) => {
+      const parts = ['### User Request'];
+      const prompt = String(problem ?? '').trim();
+      const path = String(testFilePath ?? '').trim();
+
+      if (prompt) {
+        parts.push('- Prompt:');
+        parts.push(prompt);
+      } else {
+        parts.push('- Prompt: (empty)');
+      }
+
+      if (path) {
+        parts.push('- Test File: ' + path);
+      }
+
+      const profile = findProfile(profileId);
+      if (profile && typeof profile.name === 'string' && profile.name.trim()) {
+        parts.push('- Profile: ' + profile.name.trim());
+      }
+
+      return parts.join('\\n');
+    };
+
+    const formatSuccessResult = (result, passed) => {
+      const parts = ['### Result', '- Status: ' + (passed ? 'passed' : 'failed')];
+
+      if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return parts.join('\\n');
+      }
+
+      const topFields = [];
+      pushField(topFields, 'Stage', result.stage);
+      pushField(topFields, 'Message', result.message);
+      for (const field of topFields) {
+        parts.push('- ' + field);
+      }
+
+      const testResult = result.code_test_res_dict;
+      if (testResult && typeof testResult === 'object' && !Array.isArray(testResult)) {
+        const testParts = [];
+        if (typeof testResult.passed === 'boolean') {
+          testParts.push('Passed: ' + (testResult.passed ? 'true' : 'false'));
+        }
+        pushField(testParts, 'Stage', testResult.stage);
+        pushField(testParts, 'Error Type', testResult.error_type ?? testResult.errorType ?? testResult.type);
+        pushField(testParts, 'Error', testResult.error);
+        pushField(testParts, 'Traceback', testResult.traceback);
+
+        if (testParts.length > 0) {
+          parts.push('- Test Result:');
+          for (const line of testParts) {
+            parts.push('  - ' + line);
+          }
+        }
+      }
+
+      return parts.join('\\n');
+    };
+
+    const formatFailureReason = (data) => {
+      const reason = typeof data.failureReason === 'string' ? data.failureReason.trim() : '';
+      const isRetryExhausted = /(?:after\\s*10\\s*attempts?|10\\s*attempts?)/i.test(reason);
+      if (reason && isRetryExhausted) {
+        return ['### Failure', '- Error: ' + reason].join('\\n');
+      }
+
+      const result = data.result;
+      if (result && typeof result === 'object' && !Array.isArray(result)) {
+        const error = [result.error, result.reason, result.message, reason].find((item) => typeof item === 'string' && item.trim());
+        const errorType = [result.type, result.errorType, result.error_type, result.exception_type, result.exception].find((item) => typeof item === 'string' && item.trim());
+        const traceback = [result.traceback, result.stack, result.stderr].find((item) => typeof item === 'string' && item.trim());
+
+        const parts = ['### Failure'];
+        if (typeof error === 'string' && error.trim()) {
+          parts.push('- Error: ' + error.trim());
+        }
+        if (typeof errorType === 'string' && errorType.trim()) {
+          parts.push('- Type: ' + errorType.trim());
+        }
+        if (typeof traceback === 'string' && traceback.trim()) {
+          parts.push('- Traceback:');
+          parts.push(traceback.trim());
+        }
+
+        if (parts.length > 1) {
+          return parts.join('\\n');
+        }
+      }
+
+      if (reason) {
+        return ['### Failure', '- Error: ' + reason].join('\\n');
+      }
+
+      return ['### Failure', '- Error: Workflow failed without a detailed reason.'].join('\\n');
+    };
+
     const setRunning = (running) => {
+      const wasRunning = state.running;
       state.running = running;
       document.getElementById('runBtn').disabled = running;
-      statusText.textContent = running ? 'Running...' : 'Idle';
+      statusText.textContent = running ? 'Loading...' : 'Idle';
+
+      if (running && !wasRunning) {
+        state.taskCounter += 1;
+        addTaskSeparator(state.taskCounter);
+        if (state.pendingTaskRequest) {
+          addLog(state.pendingTaskRequest, 'user-request');
+          state.pendingTaskRequest = '';
+        }
+      }
+
+      if (running) {
+        showLoading();
+      } else {
+        hideLoading();
+      }
     };
 
     const renderProfileOptions = () => {
@@ -1354,11 +1830,25 @@ function getChatHtml(webview: vscode.Webview): string {
     });
 
     document.getElementById('runBtn').addEventListener('click', () => {
+      const problem = problemInput.value;
+      const testFilePath = testPathInput.value;
+      const profileId = taskProfileSelect.value;
+      state.pendingTaskRequest = formatTaskRequest(problem, testFilePath, profileId);
+
       vscode.postMessage({
         type: 'runWorkflow',
-        problem: problemInput.value,
-        testFilePath: testPathInput.value
+        problem,
+        testFilePath
       });
+    });
+
+    problemInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        if (!state.running) {
+          document.getElementById('runBtn').click();
+        }
+      }
     });
 
     window.addEventListener('message', (event) => {
@@ -1405,24 +1895,29 @@ function getChatHtml(webview: vscode.Webview): string {
             addLog(data.text, level);
           }
           break;
+        case 'workflowError': {
+          hideLoading();
+          clearTaskInputs();
+          const reason = typeof data.reason === 'string' && data.reason.trim()
+            ? data.reason.trim()
+            : 'Workflow failed without a detailed reason.';
+          addLog(['### Failure', '- Error: ' + reason].join('\\n'), 'result-fail');
+          break;
+        }
         case 'workflowResult': {
+          hideLoading();
+          clearTaskInputs();
           const passed = Boolean(data.passed);
-          const title = passed ? 'Result: tests passed' : 'Result: tests failed';
-          const card = addLog(title, passed ? 'result-pass' : 'result-fail');
 
-          if (data.result) {
-            const pre = document.createElement('pre');
-            pre.textContent = JSON.stringify(data.result, null, 2);
-            card.appendChild(pre);
+          if (!passed) {
+            addLog(formatFailureReason(data), 'result-fail');
+            break;
           }
 
+          addLog(formatSuccessResult(data.result, passed), 'result-pass');
+
           if (typeof data.code === 'string' && data.code.trim()) {
-            const openBtn = document.createElement('button');
-            openBtn.textContent = 'Open Generated Code';
-            openBtn.addEventListener('click', () => {
-              vscode.postMessage({ type: 'openGeneratedCode', code: data.code });
-            });
-            card.appendChild(openBtn);
+            addLog(['### Code', mdFence + 'python', data.code, mdFence].join('\\n'), 'code-block');
           }
           break;
         }

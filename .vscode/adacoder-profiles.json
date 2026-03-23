@@ -4,11 +4,11 @@
   "profiles": [
     {
       "id": "default",
-      "name": "Default",
-      "baseUrl": "",
+      "name": "test1",
+      "baseUrl": "https://vpsairobot.com",
       "model": "gpt-5.4",
       "provider": "other",
-      "apiKey": ""
+      "apiKey": "sk-57a1d70c8bca4596decd3f7401dfe656b3c28f102da75921710b1e7a00fe0b9e"
     }
   ]
 }

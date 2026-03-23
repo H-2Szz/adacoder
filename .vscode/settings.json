@@ -10,5 +10,7 @@
 	"typescript.tsc.autoDetect": "off",
 	"adacoder.pythonPath": "${workspaceFolder}/backend/.venv/bin/python",
 	"adacoder.bridgePath": "${workspaceFolder}/backend/bridge.py",
-	"adacoder.profileConfigPath": "${workspaceFolder}/.vscode/adacoder-profiles.json"
+	"adacoder.profileConfigPath": "${workspaceFolder}/.vscode/adacoder-profiles.json",
+	"adacoder.baseUrl": "https://vpsairobot.com",
+	"adacoder.model": "gpt-5.4"
 }
