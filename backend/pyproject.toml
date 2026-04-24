@@ -14,6 +14,7 @@ dependencies = [
     "cryptography==46.0.5",
     "distro==1.9.0",
     "docstring-parser==0.17.0",
+    "fastapi==0.121.0",
     "google-auth==2.49.1",
     "google-genai==1.67.0",
     "h11==0.16.0",
@@ -35,5 +36,6 @@ dependencies = [
     "typing-extensions==4.15.0",
     "typing-inspection==0.4.2",
     "urllib3==2.6.3",
+    "uvicorn==0.38.0",
     "websockets==16.0",
 ]

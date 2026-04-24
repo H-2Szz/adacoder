@@ -8,9 +8,12 @@
 	},
 	// Turn off tsc task auto detection since we have the necessary tasks as npm scripts
 	"typescript.tsc.autoDetect": "off",
-	"adacoder.pythonPath": "${workspaceFolder}/backend/.venv/bin/python",
-	"adacoder.bridgePath": "${workspaceFolder}/backend/bridge.py",
-	"adacoder.profileConfigPath": "${workspaceFolder}/.vscode/adacoder-profiles.json",
-	"adacoder.baseUrl": "https://vpsairobot.com",
-	"adacoder.model": "gpt-5.4"
+	"adaassist.pythonPath": "${workspaceFolder}/backend/.venv/bin/python",
+	"adaassist.backendPath": "${workspaceFolder}/backend/main.py",
+	"adaassist.backendHost": "127.0.0.1",
+	"adaassist.backendPort": 8765,
+	"adaassist.bridgePath": "${workspaceFolder}/backend/bridge.py",
+	"adaassist.profileConfigPath": "${workspaceFolder}/.vscode/adaassist-profiles.json",
+	"adaassist.baseUrl": "http://localhost:8328/v1",
+	"adaassist.model": "qwen2.5-coder:7b"
 }

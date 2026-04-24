@@ -1,25 +1,76 @@
 import * as vscode from 'vscode';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as readline from 'node:readline';
+import { setTimeout as delay } from 'node:timers/promises';
 
-interface WorkflowArgs {
+interface LlmRequestConfig {
 	base_url: string;
 	api_key: string;
 	model: string;
 	provider: ProviderType;
-	problem: string;
-	test_file_path: string;
 }
 
-interface BridgeResponse {
-	id: string | null;
+interface WorkflowArgs {
+	problem: string;
+	test_text: string;
+	test_mode: TestMode;
+}
+
+interface BackendSessionRequest extends WorkflowArgs {
+	llm: LlmRequestConfig;
+	context_enabled: boolean;
+	max_rounds: number;
+}
+
+interface BackendSessionState {
+	session_id: string;
+	problem_statement: string;
+	test_text: string;
+	test_mode: TestMode;
+	context_enabled: boolean;
+	max_rounds: number;
+	status: string;
+	current_stage: string;
+	current_code: string;
+	current_plan: string;
+	resolved_test_code: string;
+	latest_evaluation?: WorkflowResult;
+	passed: boolean;
+	attempt_count: number;
+	regeneration_count: number;
+	events: BackendEvent[];
+	context_entries: Array<Record<string, unknown>>;
+	created_at: string;
+	updated_at: string;
+	available_actions: string[];
+}
+
+interface BackendEvent {
+	id: string;
+	stage: string;
+	status: string;
+	title: string;
+	message: string;
+	data?: Record<string, unknown>;
+	created_at: string;
+}
+
+interface BackendActionResult {
+	stage?: string;
+	message?: string;
+	passed?: boolean;
+	interrupted?: boolean;
+	[key: string]: unknown;
+}
+
+interface BackendResponse {
 	ok: boolean;
-	result?: unknown;
-	error?: string;
-	traceback?: string;
+	session?: BackendSessionState;
+	sessions?: BackendSessionState[];
+	stage_result?: BackendActionResult;
+	detail?: string;
 }
 
 type WorkflowResult = {
@@ -32,10 +83,34 @@ type BridgeLogLevel = 'runtime' | 'stdout' | 'stderr' | 'info' | 'error';
 
 interface RunRequest {
 	problem: string;
-	testFilePath: string;
+	testText: string;
+	testMode: TestMode;
+	contextEnabled: boolean;
+	maxRounds: number;
+	executionMode: 'auto' | 'continue';
 }
 
+type InteractionState = 'idle' | 'await_plan' | 'await_failure_choice' | 'done';
+
+interface ActionRequestState {
+	problem?: string;
+	testText?: string;
+	testMode?: TestMode;
+	useErrorFeedback: boolean;
+	contextEnabled?: boolean;
+	maxRounds?: number;
+	planOverride?: string;
+	executionMode?: 'auto' | 'continue';
+}
+
+type ResumeState =
+	| { kind: 'interactive-initial-evaluate'; request: RunRequest }
+	| { kind: 'interactive-plan-evaluate'; request: ActionRequestState }
+	| { kind: 'interactive-restart-evaluate'; request: ActionRequestState }
+	| { kind: 'auto'; request: RunRequest };
+
 type ProviderType = 'openai' | 'claude' | 'other' | 'ollama' | 'vllm';
+type TestMode = 'manual' | 'generate';
 
 interface ProfileMeta {
 	id: string;
@@ -55,30 +130,194 @@ interface ProfileFileData {
 	profiles: Profile[];
 }
 
-const LEGACY_API_KEY_SECRET = 'adacoder.apiKey';
+const EXTENSION_ID = 'adaassist';
+const LEGACY_EXTENSION_ID = 'adacoder';
+const EXTENSION_DISPLAY_NAME = 'AdaAssist';
+const LEGACY_API_KEY_SECRET = `${LEGACY_EXTENSION_ID}.apiKey`;
 const PROFILE_FILE_VERSION = 1;
-const DEFAULT_PROFILE_CONFIG_RELATIVE_PATH = '.vscode/adacoder-profiles.json';
+const DEFAULT_PROFILE_CONFIG_RELATIVE_PATH = '.vscode/adaassist-profiles.json';
+const LEGACY_PROFILE_CONFIG_RELATIVE_PATH = '.vscode/adacoder-profiles.json';
+const DEFAULT_BACKEND_ENTRY_RELATIVE_PATH = 'backend/main.py';
+const DEFAULT_BACKEND_HOST = '127.0.0.1';
+const DEFAULT_BACKEND_PORT = 8765;
+
+class BackendServerManager {
+	private process: ChildProcess | undefined;
+	private startPromise: Promise<void> | undefined;
+
+	public constructor(
+		private readonly context: vscode.ExtensionContext,
+		private readonly outputChannel: vscode.OutputChannel
+	) {}
+
+	public async request<T extends BackendResponse>(pathName: string, init?: RequestInit): Promise<T> {
+		const response = await this.fetch(pathName, init);
+		const payload = await response.json() as T;
+		if (!response.ok || !payload.ok) {
+			const detail = typeof payload.detail === 'string' && payload.detail.trim()
+				? payload.detail.trim()
+				: `Backend request failed with status ${response.status}.`;
+			throw new Error(detail);
+		}
+		return payload;
+	}
+
+	public async fetch(pathName: string, init?: RequestInit, allowRestart = true): Promise<Response> {
+		await this.ensureStarted();
+		const baseUrl = this.getBaseUrl();
+
+		try {
+			return await fetch(new URL(pathName, baseUrl), {
+				...init,
+				headers: {
+					'content-type': 'application/json',
+					...(init?.headers ?? {})
+				}
+			});
+		} catch (error) {
+			if (!allowRestart) {
+				throw error;
+			}
+			this.outputChannel.appendLine(`[backend] request failed, restarting server: ${String(error)}`);
+			await this.restart();
+			return this.fetch(pathName, init, false);
+		}
+	}
+
+	public async ensureStarted(): Promise<void> {
+		if (await this.isHealthy()) {
+			return;
+		}
+
+		if (this.startPromise) {
+			await this.startPromise;
+			return;
+		}
+
+		this.startPromise = this.startServer();
+		try {
+			await this.startPromise;
+		} finally {
+			this.startPromise = undefined;
+		}
+	}
+
+	public async restart(): Promise<void> {
+		this.stop();
+		await this.ensureStarted();
+	}
+
+	public stop(): void {
+		if (this.process && !this.process.killed) {
+			this.process.kill();
+		}
+		this.process = undefined;
+		this.startPromise = undefined;
+	}
+
+	private getBaseUrl(): string {
+		const host = getConfigurationValue<string>('backendHost', DEFAULT_BACKEND_HOST) || DEFAULT_BACKEND_HOST;
+		const port = getConfigurationValue<number>('backendPort', DEFAULT_BACKEND_PORT) || DEFAULT_BACKEND_PORT;
+		return `http://${host}:${port}/`;
+	}
+
+	private async startServer(): Promise<void> {
+		const backendPath = resolveBackendEntryPath(this.context);
+		if (!fs.existsSync(backendPath)) {
+			throw new Error(`Backend entry not found: ${backendPath}`);
+		}
+
+		const pythonPath = resolvePythonPath(this.context);
+		const host = getConfigurationValue<string>('backendHost', DEFAULT_BACKEND_HOST) || DEFAULT_BACKEND_HOST;
+		const port = getConfigurationValue<number>('backendPort', DEFAULT_BACKEND_PORT) || DEFAULT_BACKEND_PORT;
+		this.outputChannel.appendLine(`[backend] python=${pythonPath}`);
+		this.outputChannel.appendLine(`[backend] entry=${backendPath}`);
+		this.outputChannel.appendLine(`[backend] listen=${host}:${port}`);
+
+		const process = spawn(
+			pythonPath,
+			[backendPath, '--host', host, '--port', String(port)],
+			{
+				cwd: path.dirname(backendPath),
+				stdio: ['ignore', 'pipe', 'pipe']
+			}
+		);
+		this.process = process;
+
+		process.stdout?.on('data', (buffer: Buffer) => {
+			const text = buffer.toString().trim();
+			if (text) {
+				this.outputChannel.appendLine(`[backend stdout] ${text}`);
+			}
+		});
+
+		process.stderr?.on('data', (buffer: Buffer) => {
+			const text = buffer.toString().trim();
+			if (text) {
+				this.outputChannel.appendLine(`[backend stderr] ${text}`);
+			}
+		});
+
+		process.on('exit', (code, signal) => {
+			this.outputChannel.appendLine(`[backend exit] code=${code ?? 'null'} signal=${signal ?? 'null'}`);
+			this.process = undefined;
+		});
+
+		for (let attempt = 0; attempt < 40; attempt += 1) {
+			if (await this.isHealthy()) {
+				this.outputChannel.appendLine('[backend] server is ready');
+				return;
+			}
+			await delay(250);
+		}
+
+		throw new Error('Timed out waiting for FastAPI backend to become ready.');
+	}
+
+	private async isHealthy(): Promise<boolean> {
+		try {
+			const response = await fetch(new URL('/health', this.getBaseUrl()));
+			if (!response.ok) {
+				return false;
+			}
+			const payload = await response.json() as { ok?: boolean };
+			return Boolean(payload.ok);
+		} catch {
+			return false;
+		}
+	}
+}
 
 class AdacoderChatPanel implements vscode.WebviewViewProvider {
-	public static readonly viewType = 'adacoder.sidebarView';
-	private static readonly containerCommand = 'workbench.view.extension.adacoder-sidebar';
-	private static currentPanel: AdacoderChatPanel | undefined;
+	public static readonly viewType = `${EXTENSION_ID}.sidebarView`;
+	private static readonly containerCommand = `workbench.view.extension.${EXTENSION_ID}-sidebar`;
+	public static currentPanel: AdacoderChatPanel | undefined;
 
 	private readonly providerDisposable: vscode.Disposable;
 	private view: vscode.WebviewView | undefined;
 	private readonly disposables: vscode.Disposable[] = [];
 	private readonly viewDisposables: vscode.Disposable[] = [];
+	private readonly backendServer: BackendServerManager;
 	private running = false;
+	private interruptRequested = false;
+	private pollingSession = false;
+	private sessionPollHandle: ReturnType<typeof setInterval> | undefined;
+	private lastSessionSnapshot = '';
 	private profiles: Profile[] = [];
 	private activeProfileId = '';
 	private preferredPage: 'task' | 'settings' = 'task';
 	private pendingProblem = '';
-	private pendingTestPath = '';
+	private pendingTestText = '';
+	private activeSession: BackendSessionState | undefined;
+	private workflowMode: RunRequest['executionMode'] = 'auto';
+	private interactiveState: InteractionState = 'idle';
+	private resumeState: ResumeState | undefined;
 
 	private constructor(
 		private readonly context: vscode.ExtensionContext,
 		private readonly outputChannel: vscode.OutputChannel
 	) {
+		this.backendServer = new BackendServerManager(context, outputChannel);
 		this.providerDisposable = vscode.window.registerWebviewViewProvider(AdacoderChatPanel.viewType, this, {
 			webviewOptions: {
 				retainContextWhenHidden: true
@@ -109,6 +348,11 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 		}
 	}
 
+	public disposeRuntime(): void {
+		this.stopSessionPolling();
+		this.backendServer.stop();
+	}
+
 	public showTaskPage(): void {
 		this.preferredPage = 'task';
 		this.postMessage({ type: 'switchPage', page: 'task' });
@@ -127,11 +371,11 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 		});
 	}
 
-	public setTestPath(testFilePath: string): void {
-		this.pendingTestPath = testFilePath;
+	public setTestText(testText: string): void {
+		this.pendingTestText = testText;
 		this.postMessage({
-			type: 'setTestPath',
-			testFilePath
+			type: 'prefillTestText',
+			testText
 		});
 	}
 
@@ -141,8 +385,11 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 
 	public async resolveWebviewView(webviewView: vscode.WebviewView): Promise<void> {
 		this.view = webviewView;
-		webviewView.webview.options = { enableScripts: true };
-		webviewView.webview.html = getChatHtml(webviewView.webview);
+		webviewView.webview.options = {
+			enableScripts: true,
+			localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]
+		};
+		webviewView.webview.html = getChatHtml(webviewView.webview, this.context.extensionUri);
 
 		this.clearViewDisposables();
 		webviewView.webview.onDidReceiveMessage((message: unknown) => {
@@ -159,8 +406,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 		if (this.pendingProblem) {
 			this.postMessage({ type: 'prefillProblem', problem: this.pendingProblem });
 		}
-		if (this.pendingTestPath) {
-			this.postMessage({ type: 'setTestPath', testFilePath: this.pendingTestPath });
+		if (this.pendingTestText) {
+			this.postMessage({ type: 'prefillTestText', testText: this.pendingTestText });
 		}
 	}
 
@@ -186,8 +433,100 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 		this.postMessage({
 			type: 'state',
 			profiles: this.profiles,
-			activeProfileId: this.activeProfileId
+			activeProfileId: this.activeProfileId,
+			session: this.activeSession,
+			workflowMode: this.workflowMode,
+			interactiveState: this.interactiveState,
+			canResume: Boolean(this.resumeState),
+			resumeLabel: this.resumeLabel(),
+			interruptRequested: this.interruptRequested
 		});
+	}
+
+	private resumeLabel(): string {
+		if (!this.resumeState) {
+			return '';
+		}
+		switch (this.resumeState.kind) {
+			case 'interactive-initial-evaluate':
+				return 'Resume to run the current code against the tests.';
+			case 'interactive-plan-evaluate':
+				return 'Resume to evaluate the latest code regenerated from the plan.';
+			case 'interactive-restart-evaluate':
+				return 'Resume to evaluate the restarted attempt.';
+			case 'auto':
+				return 'Resume the auto workflow from the current progress.';
+			default:
+				return '';
+		}
+	}
+
+	private clearResumeState(): void {
+		this.resumeState = undefined;
+	}
+
+	private sessionSnapshot(session: BackendSessionState | undefined): string {
+		if (!session) {
+			return '';
+		}
+		return [
+			session.session_id,
+			session.updated_at,
+			String(session.events.length),
+			session.current_stage,
+			session.status,
+			String(session.resolved_test_code.length),
+			String(session.current_code.length),
+			String(session.current_plan.length)
+		].join(':');
+	}
+
+	private startSessionPolling(): void {
+		if (this.sessionPollHandle) {
+			return;
+		}
+		this.lastSessionSnapshot = this.sessionSnapshot(this.activeSession);
+		this.sessionPollHandle = setInterval(() => {
+			void this.refreshActiveSession();
+		}, 450);
+	}
+
+	private stopSessionPolling(): void {
+		if (this.sessionPollHandle) {
+			clearInterval(this.sessionPollHandle);
+			this.sessionPollHandle = undefined;
+		}
+		this.pollingSession = false;
+	}
+
+	private async refreshActiveSession(force = false): Promise<void> {
+		if (!this.activeSession?.session_id || this.pollingSession) {
+			return;
+		}
+
+		this.pollingSession = true;
+		try {
+			const currentSessionId = this.activeSession.session_id;
+			const payload = await this.backendServer.request<BackendResponse>(`/api/sessions/${currentSessionId}`);
+			const session = payload.session;
+			if (!session || session.session_id !== currentSessionId) {
+				return;
+			}
+
+			const snapshot = this.sessionSnapshot(session);
+			const changed = force || snapshot !== this.lastSessionSnapshot;
+			this.activeSession = session;
+			this.lastSessionSnapshot = snapshot;
+
+			if (changed) {
+				await this.postState();
+				this.postSessionState();
+			}
+		} catch {
+			// Ignore transient polling failures while a workflow action is running.
+		} finally {
+			this.pollingSession = false;
+		}
 	}
 
 	private getActiveProfile(): Profile | undefined {
@@ -230,30 +569,88 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 				}
 				case 'runWorkflow': {
 					const problem = typeof message.problem === 'string' ? message.problem : '';
-					const testFilePath = typeof message.testFilePath === 'string' ? message.testFilePath : '';
-					await this.executeWorkflow(context, { problem, testFilePath });
+					const testText = typeof message.testText === 'string' ? message.testText : '';
+					const testMode: TestMode = message.testMode === 'generate' ? 'generate' : 'manual';
+					const contextEnabled = typeof message.contextEnabled === 'boolean' ? message.contextEnabled : false;
+					const maxRounds = typeof message.maxRounds === 'number' ? message.maxRounds : 10;
+					const executionMode = message.executionMode === 'continue' ? 'continue' : 'auto';
+					await this.executeWorkflow(context, { problem, testText, testMode, contextEnabled, maxRounds, executionMode });
 					break;
 				}
-				case 'selectTestFile': {
-					const selectedPath = await pickTestFilePath();
-					if (selectedPath) {
-						this.setTestPath(selectedPath);
-					}
+				case 'interruptWorkflow': {
+					await this.interruptWorkflow();
+					break;
+				}
+				case 'resumeWorkflow': {
+					await this.resumeWorkflow(context);
+					break;
+				}
+				case 'continueWithPlan': {
+					const request = this.parseActionRequest(message);
+					await this.continueWithPlan(context, request);
+					break;
+				}
+				case 'continueWithFeedback': {
+					const request = this.parseActionRequest(message);
+					await this.continueWithFeedback(context, request);
+					break;
+				}
+				case 'restartInteractiveWorkflow': {
+					const request = this.parseActionRequest(message);
+					await this.restartInteractiveWorkflow(context, request);
+					break;
+				}
+				case 'stopInteractiveWorkflow': {
+					await this.stopInteractiveWorkflow();
+					break;
+				}
+				case 'runWorkflowAction': {
+					const action = typeof message.action === 'string' ? message.action : '';
+					await this.runWorkflowAction(context, {
+						...this.parseActionRequest(message),
+						action
+					});
+					break;
+				}
+				case 'updateWorkflowPlan': {
+					const plan = typeof message.plan === 'string' ? message.plan : '';
+					await this.updateWorkflowPlan(context, plan);
+					break;
+				}
+				case 'updateResolvedTests': {
+					const resolvedTestCode = typeof message.resolvedTestCode === 'string' ? message.resolvedTestCode : '';
+					await this.updateResolvedTests(context, resolvedTestCode);
+					break;
+				}
+				case 'clearWorkflowSession': {
+					await this.clearWorkflowSession();
 					break;
 				}
 				case 'useEditorSelection': {
+					const target = message.target === 'tests' ? 'tests' : 'problem';
 					const selection = getSelectedText();
 					if (!selection) {
 						this.appendUiLog('error', 'No editor selection found.');
 						return;
 					}
-					this.prefillProblem(selection);
+					if (target === 'tests') {
+						this.setTestText(selection);
+					} else {
+						this.prefillProblem(selection);
+					}
 					break;
 				}
 				case 'openGeneratedCode': {
 					const code = typeof message.code === 'string' ? message.code : '';
 					if (code) {
 						await openGeneratedCode(code);
+					}
+					break;
+				}
+				case 'insertGeneratedCode': {
+					const code = typeof message.code === 'string' ? message.code : '';
+					if (code) {
+						await insertGeneratedCode(code);
 					}
 					break;
 				}
@@ -351,80 +748,699 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 		this.appendUiLog('info', 'Profile deleted.');
 	}
 
-	private async executeWorkflow(context: vscode.ExtensionContext, request: RunRequest): Promise<void> {
+	private validateRunRequest(request: RunRequest): Profile | undefined {
+		const profile = this.getActiveProfile();
+		if (!profile) {
+			this.appendUiLog('error', 'No active profile. Please create one in Settings.');
+			this.showSettingsPage();
+			return undefined;
+		}
+
+		const problem = request.problem.trim();
+		const testText = request.testText.trim();
+		if (!problem) {
+			this.appendUiLog('error', 'Problem input is required.');
+			return undefined;
+		}
+		if (request.testMode === 'manual' && !testText) {
+			this.appendUiLog('error', 'Test text is required in manual test mode.');
+			return undefined;
+		}
+		if (!profile.apiKey && profile.provider !== 'ollama' && profile.provider !== 'vllm') {
+			this.appendUiLog('error', `Profile "${profile.name}" does not have an API key.`);
+			this.showSettingsPage();
+			return undefined;
+		}
+
+		return profile;
+	}
+
+	private buildSessionArgs(profile: Profile, request: RunRequest): BackendSessionRequest {
+		return {
+			problem: request.problem.trim(),
+			test_text: request.testText.trim(),
+			test_mode: request.testMode,
+			llm: {
+				base_url: profile.baseUrl,
+				api_key: profile.apiKey,
+				model: profile.model,
+				provider: profile.provider
+			},
+			context_enabled: request.contextEnabled,
+			max_rounds: request.maxRounds
+		};
+	}
+
+	private postSessionState(stageResult?: BackendActionResult): void {
+		this.postMessage({
+			type: 'workflowSession',
+			session: this.activeSession,
+			stageResult,
+			workflowMode: this.workflowMode,
+			interactiveState: this.interactiveState,
+			canResume: Boolean(this.resumeState),
+			resumeLabel: this.resumeLabel(),
+			interruptRequested: this.interruptRequested
+		});
+	}
+
+	private parseActionRequest(message: Record<string, unknown>): {
+		problem?: string;
+		testText?: string;
+		testMode?: TestMode;
+		useErrorFeedback: boolean;
+		contextEnabled?: boolean;
+		maxRounds?: number;
+		planOverride?: string;
+		executionMode?: 'auto' | 'continue';
+	} {
+		const testMode: TestMode | undefined = message.testMode === 'generate'
+			? 'generate'
+			: message.testMode === 'manual'
+				? 'manual'
+				: undefined;
+		const executionMode = message.executionMode === 'continue' ? 'continue' : message.executionMode === 'auto' ? 'auto' : undefined;
+
+		return {
+			problem: typeof message.problem === 'string' ? message.problem : undefined,
+			testText: typeof message.testText === 'string' ? message.testText : undefined,
+			testMode,
+			useErrorFeedback: typeof message.useErrorFeedback === 'boolean' ? message.useErrorFeedback : true,
+			contextEnabled: typeof message.contextEnabled === 'boolean' ? message.contextEnabled : undefined,
+			maxRounds: typeof message.maxRounds === 'number' ? message.maxRounds : undefined,
+			planOverride: typeof message.planOverride === 'string' ? message.planOverride : undefined,
+			executionMode
+		};
+	}
+
+	private setRunState(running: boolean, label = ''): void {
+		this.postMessage({
+			type: 'runState',
+			running,
+			label
+		});
+	}
+
+	private async interruptWorkflow(): Promise<void> {
+		if (!this.running) {
+			return;
+		}
+
+		this.interruptRequested = true;
+		this.setRunState(true, 'Stopping after the current stage...');
+		await this.postState();
+
+		if (this.workflowMode === 'auto' && this.activeSession?.session_id) {
+			try {
+				await this.backendServer.fetch(`/api/sessions/${this.activeSession.session_id}/interrupt`, {
+					method: 'POST'
+				});
+			} catch (error) {
+				this.appendUiLog('error', `Failed to request interrupt: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+	}
+
+	private async pauseIfInterrupted(resumeState: ResumeState, message: string): Promise<boolean> {
+		if (!this.interruptRequested) {
+			return false;
+		}
+
+		this.interruptRequested = false;
+		this.resumeState = resumeState;
+		await this.postState();
+		this.postSessionState({
+			stage: 'interrupt',
+			message,
+			interrupted: true,
+			passed: this.activeSession?.passed ?? false
+		});
+		return true;
+	}
+
+	private async resumeWorkflow(context: vscode.ExtensionContext): Promise<void> {
+		if (!this.resumeState) {
+			return;
+		}
+
+		const resumeState = this.resumeState;
+		this.resumeState = undefined;
+		this.interruptRequested = false;
+		await this.postState();
+
+		if (resumeState.kind === 'interactive-initial-evaluate') {
+			await this.runGuarded('Resuming with evaluation...', 'Resume failed', async () => {
+				this.workflowMode = 'continue';
+				await this.invokeWorkflowAction({
+					action: 'evaluate',
+					problem: resumeState.request.problem,
+					testText: resumeState.request.testText,
+					testMode: resumeState.request.testMode,
+					useErrorFeedback: true,
+					contextEnabled: resumeState.request.contextEnabled,
+					maxRounds: resumeState.request.maxRounds
+				});
+				this.interactiveState = this.activeSession?.passed ? 'done' : 'await_failure_choice';
+				this.postSessionState();
+			});
+			return;
+		}
+
+		if (resumeState.kind === 'interactive-plan-evaluate' || resumeState.kind === 'interactive-restart-evaluate') {
+			await this.runGuarded('Resuming with evaluation...', 'Resume failed', async () => {
+				this.workflowMode = 'continue';
+				await this.invokeWorkflowAction({
+					action: 'evaluate',
+					problem: resumeState.request.problem,
+					testText: resumeState.request.testText,
+					testMode: resumeState.request.testMode,
+					useErrorFeedback: resumeState.request.useErrorFeedback,
+					contextEnabled: resumeState.request.contextEnabled,
+					maxRounds: resumeState.request.maxRounds
+				});
+				this.interactiveState = this.activeSession?.passed ? 'done' : 'await_failure_choice';
+				this.postSessionState();
+			});
+			return;
+		}
+
+		if (resumeState.kind === 'auto') {
+			await this.runGuarded('Resuming auto workflow...', 'Resume failed', async () => {
+				this.workflowMode = 'auto';
+				const payload = await this.invokeWorkflowAction({
+					action: 'auto_resume',
+					useErrorFeedback: true,
+					contextEnabled: resumeState.request.contextEnabled,
+					maxRounds: resumeState.request.maxRounds
+				});
+				if (payload.stage_result?.interrupted) {
+					this.resumeState = { kind: 'auto', request: resumeState.request };
+				}
+				this.interactiveState = this.activeSession?.passed ? 'done' : 'idle';
+				await this.postState();
+				this.postSessionState(payload.stage_result);
+			});
+		}
+	}
+
+	private async runGuarded(
+		initialLabel: string,
+		errorPrefix: string,
+		work: () => Promise<void>
+	): Promise<void> {
 		if (this.running) {
 			this.appendUiLog('error', 'A task is already running. Please wait.');
 			return;
 		}
 
-		const profile = this.getActiveProfile();
-		if (!profile) {
-			this.appendUiLog('error', 'No active profile. Please create one in Settings.');
-			this.showSettingsPage();
-			return;
-		}
-
-		const problem = request.problem.trim();
-		const testFilePath = request.testFilePath.trim();
-		if (!problem) {
-			this.appendUiLog('error', 'Problem input is required.');
-			return;
-		}
-		if (!testFilePath) {
-			this.appendUiLog('error', 'Test file path is required.');
-			return;
-		}
-		if (!profile.apiKey) {
-			this.appendUiLog('error', `Profile "${profile.name}" does not have an API key.`);
-			this.showSettingsPage();
-			return;
-		}
-
 		this.running = true;
-		this.postMessage({ type: 'runState', running: true });
-
+		this.setRunState(true, initialLabel);
+		this.startSessionPolling();
 		try {
-			const args: WorkflowArgs = {
-				base_url: profile.baseUrl,
-				api_key: profile.apiKey,
-				model: profile.model,
-				provider: profile.provider,
-				problem,
-				test_file_path: testFilePath
-			};
-
-			const response = await invokeBridge(context, args, this.outputChannel);
-
-			if (!response.ok) {
-				const detail = response.traceback ? `\n${response.traceback}` : '';
-				this.postMessage({
-					type: 'workflowError',
-					reason: `Backend error: ${response.error ?? 'Unknown error'}${detail}`
-				});
-				return;
-			}
-
-			const result = response.result as WorkflowResult | undefined;
-			const passed = Boolean(result?.passed);
-			const generatedCode = typeof result?.code === 'string' ? result.code : '';
-			const failureReason = passed ? '' : extractFailureReason(result);
-			this.postMessage({
-				type: 'workflowResult',
-				passed,
-				result,
-				code: passed ? generatedCode : '',
-				failureReason
-			});
+			await work();
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			this.postMessage({
 				type: 'workflowError',
-				reason: `Execution failed: ${message}`
+				reason: `${errorPrefix}: ${message}`
 			});
 		} finally {
+			await this.refreshActiveSession(true);
+			this.stopSessionPolling();
 			this.running = false;
-			this.postMessage({ type: 'runState', running: false });
+			this.setRunState(false);
 		}
+	}
+
+	private async createWorkflowSession(profile: Profile, request: RunRequest): Promise<void> {
+		const payload = await this.backendServer.request<BackendResponse>('/api/sessions', {
+			method: 'POST',
+			body: JSON.stringify(this.buildSessionArgs(profile, request))
+		});
+		this.activeSession = payload.session;
+		this.workflowMode = request.executionMode;
+		this.interactiveState = 'idle';
+		await this.postState();
+		this.postSessionState();
+	}
+
+	private async syncWorkflowSession(profile: Profile, request: RunRequest): Promise<void> {
+		if (!this.activeSession?.session_id) {
+			await this.createWorkflowSession(profile, request);
+			return;
+		}
+
+		const payload = await this.backendServer.request<BackendResponse>(
+			`/api/sessions/${this.activeSession.session_id}`,
+			{
+				method: 'PATCH',
+				body: JSON.stringify({
+					problem: request.problem.trim(),
+					test_text: request.testText.trim(),
+					test_mode: request.testMode,
+					context_enabled: request.contextEnabled,
+					max_rounds: request.maxRounds
+				})
+			}
+		);
+		this.activeSession = payload.session;
+		this.workflowMode = request.executionMode;
+		await this.postState();
+		this.postSessionState();
+	}
+
+	private async ensureSessionForStandaloneTestAction(request: {
+		problem?: string;
+		testText?: string;
+		testMode?: TestMode;
+		contextEnabled?: boolean;
+		maxRounds?: number;
+		executionMode?: 'auto' | 'continue';
+	}): Promise<boolean> {
+		if (this.activeSession?.session_id) {
+			return true;
+		}
+
+		const draftRequest: RunRequest = {
+			problem: request.problem ?? '',
+			testText: request.testText ?? '',
+			testMode: request.testMode ?? 'generate',
+			contextEnabled: request.contextEnabled ?? false,
+			maxRounds: request.maxRounds ?? 10,
+			executionMode: request.executionMode ?? this.workflowMode
+		};
+		const profile = this.validateRunRequest(draftRequest);
+		if (!profile) {
+			return false;
+		}
+
+		await this.createWorkflowSession(profile, draftRequest);
+		return true;
+	}
+
+	private async invokeWorkflowAction(
+		request: {
+			action: string;
+			problem?: string;
+			testText?: string;
+			testMode?: TestMode;
+			useErrorFeedback: boolean;
+			contextEnabled?: boolean;
+			maxRounds?: number;
+			planOverride?: string;
+			resolvedTestCode?: string;
+		}
+	): Promise<BackendResponse> {
+		if (!this.activeSession?.session_id) {
+			throw new Error('No active workflow session. Start a session first.');
+		}
+
+		const payload = await this.backendServer.request<BackendResponse>(
+			`/api/sessions/${this.activeSession.session_id}/actions`,
+			{
+				method: 'POST',
+				body: JSON.stringify({
+					action: request.action,
+					problem: request.problem,
+					test_text: request.testText,
+					test_mode: request.testMode,
+					use_error_feedback: request.useErrorFeedback,
+					context_enabled: request.contextEnabled,
+					max_rounds: request.maxRounds,
+					plan_override: request.planOverride,
+					resolved_test_code: request.resolvedTestCode
+				})
+			}
+		);
+
+		this.activeSession = payload.session;
+		await this.postState();
+		this.postSessionState(payload.stage_result);
+		return payload;
+	}
+
+	private async executeWorkflow(_context: vscode.ExtensionContext, request: RunRequest): Promise<void> {
+		const profile = this.validateRunRequest(request);
+		if (!profile) {
+			return;
+		}
+
+		await this.runGuarded(
+			request.executionMode === 'auto' ? 'Starting auto workflow...' : 'Starting interactive workflow...',
+			'Execution failed',
+			async () => {
+			this.clearResumeState();
+			this.interruptRequested = false;
+			const hadSession = Boolean(this.activeSession?.session_id);
+			await this.syncWorkflowSession(profile, request);
+
+				if (request.executionMode === 'auto') {
+					this.setRunState(true, 'Running the full workflow until the retry limit...');
+					const payload = await this.invokeWorkflowAction({
+					action: 'auto',
+					useErrorFeedback: true,
+					contextEnabled: request.contextEnabled,
+					maxRounds: request.maxRounds
+				});
+					if (payload.stage_result?.interrupted) {
+						this.resumeState = { kind: 'auto', request };
+						this.interruptRequested = false;
+						await this.postState();
+					}
+					this.interactiveState = this.activeSession?.passed ? 'done' : 'idle';
+					this.postSessionState();
+					return;
+				}
+
+				this.setRunState(true, hadSession ? 'Restarting the current workflow from the latest setup...' : 'Generating initial code...');
+				await this.invokeWorkflowAction({
+					action: hadSession ? 'restart' : 'generate',
+					problem: request.problem,
+					testText: request.testText,
+					testMode: request.testMode,
+					useErrorFeedback: !hadSession,
+					contextEnabled: request.contextEnabled,
+					maxRounds: request.maxRounds
+				});
+				if (await this.pauseIfInterrupted(
+					{ kind: 'interactive-initial-evaluate', request },
+					'Interactive workflow paused after code generation. Resume to run evaluation.'
+				)) {
+					return;
+				}
+
+				this.setRunState(true, 'Evaluating generated code...');
+				await this.invokeWorkflowAction({
+					action: 'evaluate',
+					problem: request.problem,
+					testText: request.testText,
+					testMode: request.testMode,
+					useErrorFeedback: true,
+					contextEnabled: request.contextEnabled,
+					maxRounds: request.maxRounds
+				});
+
+				this.interruptRequested = false;
+				if (this.activeSession?.passed) {
+					this.interactiveState = 'done';
+					this.postSessionState();
+					return;
+				}
+
+				this.interactiveState = 'await_failure_choice';
+				this.postSessionState();
+			}
+		);
+	}
+
+	private async continueWithPlan(
+		_context: vscode.ExtensionContext,
+		request: {
+			problem?: string;
+			testText?: string;
+			testMode?: TestMode;
+			useErrorFeedback: boolean;
+			contextEnabled?: boolean;
+			maxRounds?: number;
+			planOverride?: string;
+		}
+	): Promise<void> {
+		if (!this.activeSession?.session_id) {
+			this.appendUiLog('error', 'No active workflow session. Start a session first.');
+			return;
+		}
+
+		await this.runGuarded('Regenerating from the current plan...', 'Continue failed', async () => {
+			this.workflowMode = 'continue';
+			this.clearResumeState();
+			this.setRunState(true, 'Saving the current plan and regenerating code...');
+			await this.invokeWorkflowAction({
+				action: 'regenerate',
+				problem: request.problem,
+				testText: request.testText,
+				testMode: request.testMode,
+				useErrorFeedback: true,
+				contextEnabled: request.contextEnabled,
+				maxRounds: request.maxRounds,
+				planOverride: request.planOverride
+			});
+			if (await this.pauseIfInterrupted(
+				{ kind: 'interactive-plan-evaluate', request },
+				'Interactive workflow paused after regenerating code. Resume to run evaluation.'
+			)) {
+				return;
+			}
+
+			this.setRunState(true, 'Evaluating regenerated code...');
+			await this.invokeWorkflowAction({
+				action: 'evaluate',
+				problem: request.problem,
+				testText: request.testText,
+				testMode: request.testMode,
+				useErrorFeedback: true,
+				contextEnabled: request.contextEnabled,
+				maxRounds: request.maxRounds
+			});
+
+			this.interruptRequested = false;
+			this.interactiveState = this.activeSession?.passed ? 'done' : 'await_failure_choice';
+			this.postSessionState();
+		});
+	}
+
+	private async continueWithFeedback(
+		_context: vscode.ExtensionContext,
+		request: {
+			problem?: string;
+			testText?: string;
+			testMode?: TestMode;
+			useErrorFeedback: boolean;
+			contextEnabled?: boolean;
+			maxRounds?: number;
+			planOverride?: string;
+		}
+	): Promise<void> {
+		if (!this.activeSession?.session_id) {
+			this.appendUiLog('error', 'No active workflow session. Start a session first.');
+			return;
+		}
+
+		await this.runGuarded('Creating a new plan from the latest feedback...', 'Plan failed', async () => {
+			this.workflowMode = 'continue';
+			this.clearResumeState();
+			this.setRunState(true, 'Generating a fresh repair plan...');
+			await this.invokeWorkflowAction({
+				action: 'plan',
+				problem: request.problem,
+				testText: request.testText,
+				testMode: request.testMode,
+				useErrorFeedback: true,
+				contextEnabled: request.contextEnabled,
+				maxRounds: request.maxRounds,
+				planOverride: request.planOverride
+			});
+			this.interruptRequested = false;
+			this.interactiveState = 'await_plan';
+			this.postSessionState();
+		});
+	}
+
+	private async restartInteractiveWorkflow(
+		_context: vscode.ExtensionContext,
+		request: {
+			problem?: string;
+			testText?: string;
+			testMode?: TestMode;
+			useErrorFeedback: boolean;
+			contextEnabled?: boolean;
+			maxRounds?: number;
+			planOverride?: string;
+		}
+	): Promise<void> {
+		if (!this.activeSession?.session_id) {
+			this.appendUiLog('error', 'No active workflow session. Start a session first.');
+			return;
+		}
+
+		await this.runGuarded('Restarting from the original requirement...', 'Restart failed', async () => {
+			this.workflowMode = 'continue';
+			this.clearResumeState();
+			this.setRunState(true, 'Generating a fresh attempt from the requirement...');
+			await this.invokeWorkflowAction({
+				action: 'restart',
+				problem: request.problem,
+				testText: request.testText,
+				testMode: request.testMode,
+				useErrorFeedback: false,
+				contextEnabled: request.contextEnabled,
+				maxRounds: request.maxRounds
+			});
+			if (await this.pauseIfInterrupted(
+				{ kind: 'interactive-restart-evaluate', request },
+				'Interactive workflow paused after restarting from the requirement. Resume to run evaluation.'
+			)) {
+				return;
+			}
+
+			this.setRunState(true, 'Evaluating the restarted attempt...');
+			await this.invokeWorkflowAction({
+				action: 'evaluate',
+				problem: request.problem,
+				testText: request.testText,
+				testMode: request.testMode,
+				useErrorFeedback: false,
+				contextEnabled: request.contextEnabled,
+				maxRounds: request.maxRounds
+			});
+
+			this.interruptRequested = false;
+			this.interactiveState = this.activeSession?.passed ? 'done' : 'await_failure_choice';
+			this.postSessionState();
+		});
+	}
+
+	private async stopInteractiveWorkflow(): Promise<void> {
+		if (!this.activeSession?.session_id) {
+			return;
+		}
+
+		this.interactiveState = 'done';
+		this.interruptRequested = false;
+		this.clearResumeState();
+		await this.postState();
+		this.postSessionState({
+			stage: 'interactive',
+			message: 'Interactive workflow paused by the user.',
+			passed: this.activeSession.passed
+		});
+	}
+
+	private async runWorkflowAction(
+		_context: vscode.ExtensionContext,
+		request: {
+			action: string;
+			problem?: string;
+			testText?: string;
+			testMode?: TestMode;
+			useErrorFeedback: boolean;
+			contextEnabled?: boolean;
+			maxRounds?: number;
+			planOverride?: string;
+			executionMode?: 'auto' | 'continue';
+		}
+	): Promise<void> {
+		await this.runGuarded(`Running ${request.action}...`, 'Action failed', async () => {
+			if (request.action === 'generate_tests') {
+				const ready = await this.ensureSessionForStandaloneTestAction({
+					problem: request.problem,
+					testText: request.testText,
+					testMode: request.testMode,
+					contextEnabled: request.contextEnabled,
+					maxRounds: request.maxRounds,
+					executionMode: request.executionMode
+				});
+				if (!ready) {
+					return;
+				}
+			}
+			await this.invokeWorkflowAction({
+				action: request.action,
+				problem: request.problem,
+				testText: request.testText,
+				testMode: request.testMode,
+				useErrorFeedback: request.useErrorFeedback,
+				contextEnabled: request.contextEnabled,
+				maxRounds: request.maxRounds,
+				planOverride: request.planOverride
+			});
+			if (request.action === 'plan' && this.workflowMode === 'continue') {
+				this.interactiveState = 'await_plan';
+				this.postSessionState();
+			}
+		});
+	}
+
+	private async updateWorkflowPlan(_context: vscode.ExtensionContext, plan: string): Promise<void> {
+		if (!this.activeSession?.session_id) {
+			this.appendUiLog('error', 'No active workflow session.');
+			return;
+		}
+
+		try {
+			const payload = await this.backendServer.request<BackendResponse>(
+				`/api/sessions/${this.activeSession.session_id}`,
+				{
+					method: 'PATCH',
+					body: JSON.stringify({ plan })
+				}
+			);
+			this.activeSession = payload.session;
+			await this.postState();
+			this.postSessionState();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.postMessage({
+				type: 'workflowError',
+				reason: `Failed to update plan: ${message}`
+			});
+		}
+	}
+
+	private async updateResolvedTests(_context: vscode.ExtensionContext, resolvedTestCode: string): Promise<void> {
+		if (!this.activeSession?.session_id) {
+			this.appendUiLog('error', 'No active workflow session.');
+			return;
+		}
+
+		try {
+			const payload = await this.backendServer.request<BackendResponse>(
+				`/api/sessions/${this.activeSession.session_id}`,
+				{
+					method: 'PATCH',
+					body: JSON.stringify({ resolved_test_code: resolvedTestCode })
+				}
+			);
+			this.activeSession = payload.session;
+			await this.postState();
+			this.postSessionState();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.postMessage({
+				type: 'workflowError',
+				reason: `Failed to update resolved tests: ${message}`
+			});
+		}
+	}
+
+	private async clearWorkflowSession(): Promise<void> {
+		this.stopSessionPolling();
+		if (!this.activeSession?.session_id) {
+			this.activeSession = undefined;
+			this.workflowMode = 'auto';
+			this.interactiveState = 'idle';
+			this.interruptRequested = false;
+			this.clearResumeState();
+			this.lastSessionSnapshot = '';
+			await this.postState();
+			return;
+		}
+
+		try {
+			await this.backendServer.fetch(`/api/sessions/${this.activeSession.session_id}`, {
+				method: 'DELETE'
+			});
+		} catch {
+			// Ignore cleanup failures for stale sessions.
+		}
+
+		this.activeSession = undefined;
+		this.workflowMode = 'auto';
+		this.interactiveState = 'idle';
+		this.interruptRequested = false;
+		this.clearResumeState();
+		this.lastSessionSnapshot = '';
+		await this.postState();
+		this.postSessionState();
 	}
 
 	private appendUiLog(level: BridgeLogLevel, text: string): void {
@@ -462,12 +1478,11 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			}
 		}
 
-		const config = vscode.workspace.getConfiguration('adacoder');
 		const defaultProfile: Profile = {
 			id: createProfileId(),
 			name: 'Default',
-			baseUrl: (config.get<string>('baseUrl', '') || '').trim(),
-			model: (config.get<string>('model', 'gpt-5.4') || 'gpt-5.4').trim(),
+			baseUrl: (getConfigurationValue<string>('baseUrl', '') || '').trim(),
+			model: (getConfigurationValue<string>('model', 'gpt-5.4') || 'gpt-5.4').trim(),
 			provider: 'other',
 			apiKey: await readLegacyApiKey(context, this.outputChannel)
 		};
@@ -487,7 +1502,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 
 		const activeProfile = this.getActiveProfile();
 		if (activeProfile) {
-			const config = vscode.workspace.getConfiguration('adacoder');
+			const config = getExtensionConfiguration();
 			const target = getConfigurationTarget();
 			await config.update('baseUrl', activeProfile.baseUrl, target);
 			await config.update('model', activeProfile.model, target);
@@ -496,7 +1511,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 }
 
 export function activate(context: vscode.ExtensionContext) {
-	const outputChannel = vscode.window.createOutputChannel('Adacoder');
+	const outputChannel = vscode.window.createOutputChannel(EXTENSION_DISPLAY_NAME);
 	context.subscriptions.push(outputChannel);
 
 	const ensureSidebarProvider = async (): Promise<AdacoderChatPanel> => {
@@ -511,26 +1526,33 @@ export function activate(context: vscode.ExtensionContext) {
 
 	void ensureSidebarProvider();
 
-	const openChatDisposable = vscode.commands.registerCommand('adacoder.openChat', async () => {
+	const registerCommand = (suffix: string, callback: () => Promise<void>) => {
+		return [
+			vscode.commands.registerCommand(`${EXTENSION_ID}.${suffix}`, callback),
+			vscode.commands.registerCommand(`${LEGACY_EXTENSION_ID}.${suffix}`, callback)
+		];
+	};
+
+	const openChatDisposables = registerCommand('openChat', async () => {
 		const panel = await ensureSidebarProvider();
 		await panel.reveal();
 		panel.showTaskPage();
 	});
 
-	const openSettingsDisposable = vscode.commands.registerCommand('adacoder.openSettings', async () => {
+	const openSettingsDisposables = registerCommand('openSettings', async () => {
 		const panel = await ensureSidebarProvider();
 		await panel.reveal();
 		panel.showSettingsPage();
 	});
 
-	const openProfileConfigDisposable = vscode.commands.registerCommand('adacoder.openProfileConfig', async () => {
+	const openProfileConfigDisposables = registerCommand('openProfileConfig', async () => {
 		await openProfileConfigFile(context);
 		const panel = await ensureSidebarProvider();
 		await panel.reveal();
 		panel.showSettingsPage();
 	});
 
-	const runWorkflowDisposable = vscode.commands.registerCommand('adacoder.runWorkflow', async () => {
+	const runWorkflowDisposables = registerCommand('runWorkflow', async () => {
 		const panel = await ensureSidebarProvider();
 		await panel.reveal();
 		panel.showTaskPage();
@@ -541,15 +1563,10 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 	});
 
-	const runFromSelectionDisposable = vscode.commands.registerCommand('adacoder.runFromSelection', async () => {
+	const runFromSelectionDisposables = registerCommand('runFromSelection', async () => {
 		const selection = getSelectedText();
 		if (!selection) {
 			void vscode.window.showWarningMessage('Please select code or text first.');
-			return;
-		}
-
-		const testFilePath = await pickTestFilePath();
-		if (!testFilePath) {
 			return;
 		}
 
@@ -557,25 +1574,51 @@ export function activate(context: vscode.ExtensionContext) {
 		await panel.reveal();
 		panel.showTaskPage();
 		panel.prefillProblem(selection);
-		panel.setTestPath(testFilePath);
-		void vscode.window.showInformationMessage('Test file selected. Click "Run Workflow" to start.');
+		void vscode.window.showInformationMessage('Requirement text loaded from the current selection.');
 	});
 
 	context.subscriptions.push(
-		openChatDisposable,
-		openSettingsDisposable,
-		openProfileConfigDisposable,
-		runWorkflowDisposable,
-		runFromSelectionDisposable
+		...openChatDisposables,
+		...openSettingsDisposables,
+		...openProfileConfigDisposables,
+		...runWorkflowDisposables,
+		...runFromSelectionDisposables
 	);
 }
 
-export function deactivate() {}
+export function deactivate() {
+	AdacoderChatPanel.currentPanel?.disposeRuntime();
+}
 
 function getConfigurationTarget(): vscode.ConfigurationTarget {
 	return vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
 		? vscode.ConfigurationTarget.Workspace
 		: vscode.ConfigurationTarget.Global;
+}
+
+function getExtensionConfiguration(): vscode.WorkspaceConfiguration {
+	return vscode.workspace.getConfiguration(EXTENSION_ID);
+}
+
+function getLegacyConfiguration(): vscode.WorkspaceConfiguration {
+	return vscode.workspace.getConfiguration(LEGACY_EXTENSION_ID);
+}
+
+function hasConfigurationOverride(section: string, key: string): boolean {
+	const inspect = vscode.workspace.getConfiguration(section).inspect(key);
+	return inspect?.workspaceFolderValue !== undefined
+		|| inspect?.workspaceValue !== undefined
+		|| inspect?.globalValue !== undefined;
+}
+
+function getConfigurationValue<T>(key: string, defaultValue: T): T {
+	if (hasConfigurationOverride(EXTENSION_ID, key)) {
+		return getExtensionConfiguration().get<T>(key, defaultValue);
+	}
+	if (hasConfigurationOverride(LEGACY_EXTENSION_ID, key)) {
+		return getLegacyConfiguration().get<T>(key, defaultValue);
+	}
+	return getExtensionConfiguration().get<T>(key, defaultValue);
 }
 
 function createProfileId(): string {
@@ -596,11 +1639,25 @@ function normalizeProvider(value: string | undefined): ProviderType {
 }
 
 function resolveProfileConfigPath(context: vscode.ExtensionContext): string {
-	const config = vscode.workspace.getConfiguration('adacoder');
-	const configuredPath = (config.get<string>('profileConfigPath', DEFAULT_PROFILE_CONFIG_RELATIVE_PATH) || '').trim();
+	const configuredPath = (getConfigurationValue<string>('profileConfigPath', DEFAULT_PROFILE_CONFIG_RELATIVE_PATH) || '').trim();
 	const rawPath = configuredPath || DEFAULT_PROFILE_CONFIG_RELATIVE_PATH;
 	const expandedPath = expandPathVariables(rawPath, context);
-	return path.isAbsolute(expandedPath) ? expandedPath : resolveRelativePath(expandedPath, context);
+	const resolvedPath = path.isAbsolute(expandedPath) ? expandedPath : resolveRelativePath(expandedPath, context);
+
+	const usesDefaultPath = rawPath === DEFAULT_PROFILE_CONFIG_RELATIVE_PATH;
+	const hasCustomPath = hasConfigurationOverride(EXTENSION_ID, 'profileConfigPath')
+		|| hasConfigurationOverride(LEGACY_EXTENSION_ID, 'profileConfigPath');
+	if (!hasCustomPath && usesDefaultPath && !fs.existsSync(resolvedPath)) {
+		const legacyExpandedPath = expandPathVariables(LEGACY_PROFILE_CONFIG_RELATIVE_PATH, context);
+		const legacyResolvedPath = path.isAbsolute(legacyExpandedPath)
+			? legacyExpandedPath
+			: resolveRelativePath(legacyExpandedPath, context);
+		if (fs.existsSync(legacyResolvedPath)) {
+			return legacyResolvedPath;
+		}
+	}
+
+	return resolvedPath;
 }
 
 async function openProfileConfigFile(context: vscode.ExtensionContext): Promise<void> {
@@ -700,47 +1757,8 @@ function getSelectedText(): string {
 	return editor.document.getText(editor.selection).trim();
 }
 
-async function pickTestFilePath(): Promise<string | undefined> {
-	const selected = await vscode.window.showOpenDialog({
-		title: 'Select test file (test_file_path)',
-		canSelectFiles: true,
-		canSelectFolders: false,
-		canSelectMany: false,
-		defaultUri: vscode.workspace.workspaceFolders?.[0]?.uri
-	});
-	if (!selected || selected.length === 0) {
-		return undefined;
-	}
-	return selected[0].fsPath;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null;
-}
-
-function extractFailureReason(result: WorkflowResult | undefined): string {
-	if (!result || !isRecord(result)) {
-		return 'Workflow failed without a detailed reason.';
-	}
-
-	const candidateKeys = [
-		'error',
-		'reason',
-		'message',
-		'failureReason',
-		'failure_reason',
-		'stderr',
-		'traceback'
-	];
-
-	for (const key of candidateKeys) {
-		const value = result[key];
-		if (typeof value === 'string' && value.trim()) {
-			return value.trim();
-		}
-	}
-
-	return 'Workflow failed without a detailed reason.';
 }
 
 function getWorkspaceRootPath(): string | undefined {
@@ -774,11 +1792,29 @@ function resolveRelativePath(input: string, context: vscode.ExtensionContext): s
 	return candidates[0] ?? input;
 }
 
-function resolveBridgePath(context: vscode.ExtensionContext): string {
-	const config = vscode.workspace.getConfiguration('adacoder');
-	const configuredPath = (config.get<string>('bridgePath', 'backend/bridge.py') || 'backend/bridge.py').trim();
+function resolveBackendEntryPath(context: vscode.ExtensionContext): string {
+	const configuredPath = (
+		getConfigurationValue<string>('backendPath', DEFAULT_BACKEND_ENTRY_RELATIVE_PATH)
+		|| DEFAULT_BACKEND_ENTRY_RELATIVE_PATH
+	).trim();
 	const expandedPath = expandPathVariables(configuredPath, context);
-	return path.isAbsolute(expandedPath) ? expandedPath : resolveRelativePath(expandedPath, context);
+	let resolvedPath = path.isAbsolute(expandedPath) ? expandedPath : resolveRelativePath(expandedPath, context);
+
+	if (!fs.existsSync(resolvedPath)) {
+		const legacyPath = (getConfigurationValue<string>('bridgePath', '') || '').trim();
+		if (legacyPath) {
+			const expandedLegacyPath = expandPathVariables(legacyPath, context);
+			const resolvedLegacyPath = path.isAbsolute(expandedLegacyPath)
+				? expandedLegacyPath
+				: resolveRelativePath(expandedLegacyPath, context);
+			const siblingMainPath = path.join(path.dirname(resolvedLegacyPath), 'main.py');
+			if (fs.existsSync(siblingMainPath)) {
+				resolvedPath = siblingMainPath;
+			}
+		}
+	}
+
+	return resolvedPath;
 }
 
 function detectPythonPath(context: vscode.ExtensionContext): string | undefined {
@@ -803,12 +1839,9 @@ function detectPythonPath(context: vscode.ExtensionContext): string | undefined 
 }
 
 function resolvePythonPath(context: vscode.ExtensionContext): string {
-	const config = vscode.workspace.getConfiguration('adacoder');
-	const inspect = config.inspect<string>('pythonPath');
-	const hasUserOverride = Boolean(
-		inspect?.workspaceValue ?? inspect?.workspaceFolderValue ?? inspect?.globalValue
-	);
-	const configured = (config.get<string>('pythonPath', 'python3') || 'python3').trim();
+	const hasUserOverride = hasConfigurationOverride(EXTENSION_ID, 'pythonPath')
+		|| hasConfigurationOverride(LEGACY_EXTENSION_ID, 'pythonPath');
+	const configured = (getConfigurationValue<string>('pythonPath', 'python3') || 'python3').trim();
 	if (!hasUserOverride) {
 		const detected = detectPythonPath(context);
 		if (detected) {
@@ -831,105 +1864,6 @@ function resolvePythonPath(context: vscode.ExtensionContext): string {
 	return resolveRelativePath(expanded, context);
 }
 
-function invokeBridge(
-	context: vscode.ExtensionContext,
-	args: WorkflowArgs,
-	outputChannel: vscode.OutputChannel
-): Promise<BridgeResponse> {
-	return new Promise((resolve, reject) => {
-		const bridgePath = resolveBridgePath(context);
-		if (!fs.existsSync(bridgePath)) {
-			reject(new Error(`bridge.py not found: ${bridgePath}`));
-			return;
-		}
-
-		const pythonPath = resolvePythonPath(context);
-		const requestId = `${Date.now()}`;
-		const request = {
-			id: requestId,
-			method: 'workflow',
-			args
-		};
-
-		outputChannel.appendLine(`[runtime] python=${pythonPath}`);
-		outputChannel.appendLine(`[runtime] bridge=${bridgePath}`);
-		outputChannel.appendLine(`[request] ${JSON.stringify(request, null, 2)}`);
-
-		const child = spawn(pythonPath, [bridgePath], {
-			cwd: path.dirname(bridgePath),
-			stdio: ['pipe', 'pipe', 'pipe']
-		});
-		const rl = readline.createInterface({ input: child.stdout });
-		let settled = false;
-
-		const timeoutHandle = setTimeout(() => {
-			if (settled) {
-				return;
-			}
-			settled = true;
-			rl.close();
-			child.kill();
-			reject(new Error('Timed out waiting for backend response (300s).'));
-		}, 300_000);
-
-		const cleanup = (): void => {
-			clearTimeout(timeoutHandle);
-			rl.close();
-		};
-
-		child.stderr.on('data', (buffer: Buffer) => {
-			const text = buffer.toString().trim();
-			if (!text) {
-				return;
-			}
-			outputChannel.appendLine(`[stderr] ${text}`);
-		});
-
-		child.on('error', (error: Error) => {
-			if (settled) {
-				return;
-			}
-			settled = true;
-			cleanup();
-			reject(new Error(`Failed to start Python process: ${error.message}`));
-		});
-
-		child.on('exit', (code, signal) => {
-			if (settled) {
-				return;
-			}
-			settled = true;
-			cleanup();
-			reject(new Error(`Backend process exited early, code=${code ?? 'null'} signal=${signal ?? 'null'}`));
-		});
-
-		rl.on('line', (line: string) => {
-			if (!line.trim()) {
-				return;
-			}
-			outputChannel.appendLine(`[stdout] ${line}`);
-
-			try {
-				const parsed = JSON.parse(line) as BridgeResponse;
-				if (parsed.id !== requestId && parsed.id !== null) {
-					return;
-				}
-				if (settled) {
-					return;
-				}
-				settled = true;
-				cleanup();
-				child.stdin.end();
-				resolve(parsed);
-			} catch {
-				// Non-JSON stdout is already written to the output channel.
-			}
-		});
-
-		child.stdin.write(`${JSON.stringify(request)}\n`);
-	});
-}
-
 async function openGeneratedCode(code: string): Promise<void> {
 	const doc = await vscode.workspace.openTextDocument({
 		language: 'python',
@@ -938,996 +1872,207 @@ async function openGeneratedCode(code: string): Promise<void> {
 	await vscode.window.showTextDocument(doc, { preview: false });
 }
 
-function getChatHtml(webview: vscode.Webview): string {
+async function insertGeneratedCode(code: string): Promise<void> {
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) {
+		throw new Error('No active editor found for code insertion.');
+	}
+
+	const selection = editor.selection;
+	const hasSelection = !selection.isEmpty;
+	const ok = await editor.edit((editBuilder) => {
+		if (hasSelection) {
+			editBuilder.replace(selection, code);
+			return;
+		}
+		editBuilder.insert(selection.active, code);
+	});
+
+	if (!ok) {
+		throw new Error('Failed to insert generated code into the editor.');
+	}
+}
+
+function getChatHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 	const nonce = randomBytes(16).toString('base64');
 	const csp = [
 		"default-src 'none'",
+		`img-src ${webview.cspSource} data:`,
 		`style-src ${webview.cspSource} 'unsafe-inline'`,
-		`script-src 'nonce-${nonce}'`,
-		'img-src data:'
+		`script-src ${webview.cspSource} 'nonce-${nonce}'`
 	].join('; ');
+	const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'webview.css'));
+	const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'webview.js'));
 
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="${csp}" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Adacoder</title>
-  <style>
-    :root {
-      color-scheme: light dark;
-      --bg: var(--vscode-editor-background);
-      --fg: var(--vscode-editor-foreground);
-      --muted: var(--vscode-descriptionForeground);
-      --border: var(--vscode-panel-border);
-      --input-bg: var(--vscode-input-background);
-      --input-fg: var(--vscode-input-foreground);
-      --btn-bg: var(--vscode-button-background);
-      --btn-fg: var(--vscode-button-foreground);
-      --btn-hover: var(--vscode-button-hoverBackground);
-      --error: var(--vscode-errorForeground);
-      --ok: var(--vscode-testing-iconPassed);
-      --warn: var(--vscode-editorWarning-foreground);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: var(--vscode-font-family);
-      background: var(--bg);
-      color: var(--fg);
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-    .header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid var(--border);
-      padding: 10px 12px;
-      gap: 10px;
-    }
-    .title { font-size: 14px; font-weight: 600; }
-    .header-actions { display: flex; gap: 6px; }
-    button {
-      border: none;
-      background: var(--btn-bg);
-      color: var(--btn-fg);
-      border-radius: 8px;
-      padding: 6px 10px;
-      cursor: pointer;
-      font-size: 12px;
-    }
-    button:hover { background: var(--btn-hover); }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .ghost {
-      background: transparent;
-      color: var(--fg);
-      border: 1px solid var(--border);
-    }
-    .tabs { display: flex; border-bottom: 1px solid var(--border); }
-    .tab-btn {
-      flex: 1;
-      background: transparent;
-      border-radius: 0;
-      border: none;
-      border-right: 1px solid var(--border);
-      color: var(--muted);
-      padding: 9px 10px;
-    }
-    .tab-btn:last-child { border-right: none; }
-    .tab-btn.active { color: var(--fg); background: var(--input-bg); }
-    .page {
-      display: none;
-      height: calc(100vh - 92px);
-      overflow: auto;
-      padding: 12px;
-      gap: 10px;
-      flex-direction: column;
-    }
-    .page.active { display: flex; }
-    .section {
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .row {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
-    .row label {
-      min-width: 70px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    select, input, textarea {
-      width: 100%;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--input-bg);
-      color: var(--input-fg);
-      padding: 8px 10px;
-      font: inherit;
-    }
-    textarea {
-      resize: vertical;
-      min-height: 120px;
-      line-height: 1.45;
-    }
-    .path-row { display: flex; gap: 8px; }
-    .path-row input { flex: 1; }
-    .actions { display: flex; justify-content: flex-end; gap: 8px; }
-    .status { font-size: 12px; color: var(--muted); }
-    .logs {
-      border: none;
-      border-radius: 0;
-      padding: 8px 6px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      max-height: 360px;
-      overflow: auto;
-    }
-    .log {
-      border: none;
-      border-radius: 0;
-      padding: 0;
-      font-size: 13px;
-      white-space: pre-wrap;
-      word-break: break-word;
-      line-height: 1.55;
-      background: transparent;
-    }
-    .log.runtime { color: var(--muted); }
-    .log.loading { color: var(--muted); font-style: italic; }
-    .log.stderr, .log.error, .log.result-fail { color: var(--error); }
-    .log.result-pass { color: var(--fg); }
-    .log.code-block { color: var(--fg); }
-    .log.user-request { color: var(--fg); }
-    .log .md-paragraph { margin: 0; }
-    .log .md-heading { font-weight: 600; margin: 0; }
-    .log .md-heading.md-h1 { font-size: 15px; }
-    .log .md-heading.md-h2 { font-size: 14px; }
-    .log .md-heading.md-h3 { font-size: 13px; }
-    .log ul { margin: 2px 0 0 18px; padding: 0; }
-    .log li { margin: 2px 0; }
-    .log code { background: var(--input-bg); padding: 1px 4px; border-radius: 4px; }
-    .md-divider { border-top: 1px solid var(--border); margin: 4px 0; }
-    .task-separator {
-      display: flex;
-      align-items: center;
-      color: var(--muted);
-      font-size: 11px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      gap: 10px;
-      margin: 10px 0 6px;
-    }
-    .task-separator::before,
-    .task-separator::after {
-      content: '';
-      flex: 1;
-      border-top: 1px dashed var(--border);
-    }
-    .task-separator span {
-      white-space: nowrap;
-      padding: 2px 8px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: var(--input-bg);
-    }
-    .hint { font-size: 12px; color: var(--muted); }
-    pre {
-      margin: 6px 0 0;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 8px;
-      overflow: auto;
-      max-height: 260px;
-      background: var(--input-bg);
-    }
-    .task-page {
-      padding: 0;
-      gap: 0;
-      overflow: hidden;
-      height: calc(100vh - 92px);
-    }
-    .task-toolbar {
-      border-bottom: 1px solid var(--border);
-      padding: 10px 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      background: var(--bg);
-    }
-    .task-toolbar-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .task-toolbar-row label {
-      min-width: 68px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .task-toolbar-row .path-row {
-      flex: 1;
-    }
-    .chat-stream {
-      flex: 1;
-      min-height: 0;
-      max-height: none;
-      margin: 12px;
-      border-radius: 10px;
-    }
-    .composer {
-      border-top: 1px solid var(--border);
-      padding: 10px 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      background: var(--bg);
-    }
-    .composer textarea {
-      min-height: 96px;
-      max-height: 220px;
-    }
-    .composer-path-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .composer-path-row input {
-      flex: 1;
-    }
-    .composer-actions {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-    .composer-actions .actions {
-      margin-left: auto;
-    }
-    pre code {
-      display: block;
-      font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
-      font-size: 12px;
-      line-height: 1.5;
-      white-space: pre;
-    }
-    .hl-comment { color: var(--vscode-descriptionForeground, #6a9955); }
-    .hl-string { color: var(--vscode-debugTokenExpression-string, #ce9178); }
-    .hl-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); }
-    .hl-builtin { color: var(--vscode-symbolIcon-functionForeground, #4ec9b0); }
-    .hl-number { color: var(--vscode-symbolIcon-numberForeground, #b5cea8); }
-    .hl-function { color: var(--vscode-symbolIcon-methodForeground, #dcdcaa); }
-  </style>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<meta http-equiv="Content-Security-Policy" content="${csp}" />
+	<link rel="stylesheet" href="${styleUri}" />
+	<title>${EXTENSION_DISPLAY_NAME}</title>
 </head>
 <body>
-  <div class="header">
-    <div class="title">Adacoder</div>
-    <div class="header-actions">
-      <button id="showOutputBtn" class="ghost">Output</button>
-    </div>
-  </div>
-
-  <div class="tabs">
-    <button id="taskTabBtn" class="tab-btn active">Task</button>
-    <button id="settingsTabBtn" class="tab-btn">Settings</button>
-  </div>
-
-  <div id="taskPage" class="page active task-page">
-    <div class="task-toolbar">
-      <div class="task-toolbar-row">
-        <label for="taskProfileSelect">Profile</label>
-        <select id="taskProfileSelect"></select>
-        <button id="newProfileFromTaskBtn" class="ghost">Add</button>
-      </div>
-
-    </div>
-
-    <div id="logs" class="logs chat-stream"></div>
-
-    <div class="composer">
-      <textarea id="problemInput" placeholder="Ask anything about your code..."></textarea>
-      <div class="composer-path-row">
-        <input id="testPathInput" placeholder="test_file_path" />
-        <button id="pickTestPathBtn" class="ghost">Browse</button>
-      </div>
-      <div class="composer-actions">
-        <div id="statusText" class="status">Idle</div>
-        <div class="actions">
-          <button id="useSelectionBtn" class="ghost">Use Selection</button>
-          <button id="runBtn">Run Workflow</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div id="settingsPage" class="page">
-    <div class="section">
-      <div class="row">
-        <label for="settingsProfileSelect">Profiles</label>
-        <select id="settingsProfileSelect"></select>
-        <button id="newProfileBtn" class="ghost">New</button>
-      </div>
-
-      <div class="row">
-        <label for="profileNameInput">Name</label>
-        <input id="profileNameInput" placeholder="Profile name" />
-      </div>
-
-      <div class="row">
-        <label for="profileBaseUrlInput">Base URL</label>
-        <input id="profileBaseUrlInput" placeholder="https://..." />
-      </div>
-
-      <div class="row">
-        <label for="profileModelInput">Model</label>
-        <input id="profileModelInput" placeholder="gpt-5.4" />
-      </div>
-
-      <div class="row">
-        <label for="profileProviderSelect">Provider</label>
-        <select id="profileProviderSelect">
-          <option value="openai">openai</option>
-          <option value="claude">claude</option>
-          <option value="other">other</option>
-          <option value="ollama">ollama</option>
-          <option value="vllm">vllm</option>
-        </select>
-      </div>
-
-      <div class="row">
-        <label for="profileApiKeyInput">API Key</label>
-        <input id="profileApiKeyInput" type="password" placeholder="API key" />
-      </div>
-
-      <div class="actions">
-        <button id="openProfileConfigBtn" class="ghost">Open Config File</button>
-        <button id="reloadProfilesBtn" class="ghost">Reload</button>
-        <button id="deleteProfileBtn" class="ghost">Delete</button>
-        <button id="saveProfileBtn">Save Profile</button>
-      </div>
-      <div id="profileHint" class="hint"></div>
-    </div>
-  </div>
-
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
-
-    const taskTabBtn = document.getElementById('taskTabBtn');
-    const settingsTabBtn = document.getElementById('settingsTabBtn');
-    const taskPage = document.getElementById('taskPage');
-    const settingsPage = document.getElementById('settingsPage');
-
-    const taskProfileSelect = document.getElementById('taskProfileSelect');
-    const settingsProfileSelect = document.getElementById('settingsProfileSelect');
-    const problemInput = document.getElementById('problemInput');
-    const testPathInput = document.getElementById('testPathInput');
-    const statusText = document.getElementById('statusText');
-    const logs = document.getElementById('logs');
-
-    const profileNameInput = document.getElementById('profileNameInput');
-    const profileBaseUrlInput = document.getElementById('profileBaseUrlInput');
-    const profileModelInput = document.getElementById('profileModelInput');
-    const profileProviderSelect = document.getElementById('profileProviderSelect');
-    const profileApiKeyInput = document.getElementById('profileApiKeyInput');
-    const profileHint = document.getElementById('profileHint');
-
-    const state = {
-      profiles: [],
-      activeProfileId: '',
-      editingProfileId: '',
-      running: false,
-      returnToTaskAfterSave: false,
-      loadingLog: null,
-      taskCounter: 0,
-      pendingTaskRequest: ''
-    };
-
-    const switchPage = (page) => {
-      const isTask = page === 'task';
-      taskPage.classList.toggle('active', isTask);
-      settingsPage.classList.toggle('active', !isTask);
-      taskTabBtn.classList.toggle('active', isTask);
-      settingsTabBtn.classList.toggle('active', !isTask);
-    };
-
-    const findProfile = (id) => state.profiles.find((profile) => profile.id === id);
-
-    const addLog = (text, className = 'info') => {
-      const div = document.createElement('div');
-      div.className = 'log ' + className;
-      div.appendChild(renderMarkdownToFragment(text));
-      logs.appendChild(div);
-      logs.scrollTop = logs.scrollHeight;
-      return div;
-    };
-
-    const addTaskSeparator = (taskNumber) => {
-      const separator = document.createElement('div');
-      separator.className = 'task-separator';
-      const label = document.createElement('span');
-      label.textContent = 'Task ' + taskNumber;
-      separator.appendChild(label);
-      logs.appendChild(separator);
-      logs.scrollTop = logs.scrollHeight;
-    };
-
-    const escapeHtml = (value) => String(value)
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;')
-      .replaceAll("'", '&#39;');
-
-    const PYTHON_KEYWORDS = new Set([
-      'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue',
-      'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in',
-      'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield'
-    ]);
-
-    const PYTHON_BUILTINS = new Set([
-      'int', 'str', 'list', 'dict', 'set', 'tuple', 'float', 'bool', 'len', 'range', 'print',
-      'enumerate', 'zip', 'map', 'filter', 'open', 'sum', 'min', 'max', 'any', 'all', 'type', 'isinstance'
-    ]);
-
-    const tokenizePython = (code) => {
-      const tokenRegex = /("""[\\s\\S]*?"""|'''[\\s\\S]*?'''|"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|#[^\\n]*|\\b[A-Za-z_][A-Za-z0-9_]*\\b|\\b\\d+(?:\\.\\d+)?\\b)/g;
-      let out = '';
-      let last = 0;
-      for (const match of code.matchAll(tokenRegex)) {
-        const token = match[0];
-        const index = match.index ?? 0;
-        out += escapeHtml(code.slice(last, index));
-
-        if (token.startsWith('#')) {
-          out += '<span class="hl-comment">' + escapeHtml(token) + '</span>';
-        } else if (token.startsWith('"') || token.startsWith("'") ) {
-          out += '<span class="hl-string">' + escapeHtml(token) + '</span>';
-        } else if (/^\\d/.test(token)) {
-          out += '<span class="hl-number">' + escapeHtml(token) + '</span>';
-        } else if (PYTHON_KEYWORDS.has(token)) {
-          out += '<span class="hl-keyword">' + escapeHtml(token) + '</span>';
-        } else if (PYTHON_BUILTINS.has(token)) {
-          out += '<span class="hl-builtin">' + escapeHtml(token) + '</span>';
-        } else {
-          const rest = code.slice(index + token.length);
-          const isFunction = /^\\s*\\(/.test(rest);
-          if (isFunction) {
-            out += '<span class="hl-function">' + escapeHtml(token) + '</span>';
-          } else {
-            out += escapeHtml(token);
-          }
-        }
-
-        last = index + token.length;
-      }
-
-      out += escapeHtml(code.slice(last));
-      return out;
-    };
-
-    const createCodeBlockElement = (code, language = 'python') => {
-      const pre = document.createElement('pre');
-      const codeEl = document.createElement('code');
-      const lang = String(language || '').toLowerCase();
-
-      if (lang === 'python' || lang === 'py' || lang === '') {
-        codeEl.className = 'language-python';
-        codeEl.innerHTML = tokenizePython(code);
-      } else {
-        codeEl.className = 'language-' + lang;
-        codeEl.textContent = code;
-      }
-
-      pre.appendChild(codeEl);
-      return pre;
-    };
-
-    const mdFence = String.fromCharCode(96).repeat(3);
-
-    const renderInlineMarkdown = (text) => {
-      const escaped = escapeHtml(text);
-      return escaped;
-    };
-
-    const renderMarkdownToFragment = (markdown) => {
-      const fragment = document.createDocumentFragment();
-      const lines = String(markdown ?? '').replaceAll('\\r\\n', '\\n').split('\\n');
-      let paragraph = [];
-
-      const flushParagraph = () => {
-        if (paragraph.length === 0) {
-          return;
-        }
-        const div = document.createElement('div');
-        div.className = 'md-paragraph';
-        div.innerHTML = renderInlineMarkdown(paragraph.join(' '));
-        fragment.appendChild(div);
-        paragraph = [];
-      };
-
-      for (let i = 0; i < lines.length; i += 1) {
-        const line = lines[i];
-        const trimmed = line.trim();
-
-        if (trimmed.startsWith(mdFence)) {
-          flushParagraph();
-          const language = trimmed.slice(3).trim();
-          const codeLines = [];
-          i += 1;
-          while (i < lines.length && !lines[i].trim().startsWith(mdFence)) {
-            codeLines.push(lines[i]);
-            i += 1;
-          }
-          fragment.appendChild(createCodeBlockElement(codeLines.join('\\n'), language));
-          continue;
-        }
-
-        if (!trimmed) {
-          flushParagraph();
-          continue;
-        }
-
-        if (trimmed === '---' || trimmed === '***') {
-          flushParagraph();
-          const divider = document.createElement('div');
-          divider.className = 'md-divider';
-          fragment.appendChild(divider);
-          continue;
-        }
-
-        if (trimmed.startsWith('### ')) {
-          flushParagraph();
-          const heading = document.createElement('div');
-          heading.className = 'md-heading md-h3';
-          heading.innerHTML = renderInlineMarkdown(trimmed.slice(4));
-          fragment.appendChild(heading);
-          continue;
-        }
-
-        if (trimmed.startsWith('## ')) {
-          flushParagraph();
-          const heading = document.createElement('div');
-          heading.className = 'md-heading md-h2';
-          heading.innerHTML = renderInlineMarkdown(trimmed.slice(3));
-          fragment.appendChild(heading);
-          continue;
-        }
-
-        if (trimmed.startsWith('# ')) {
-          flushParagraph();
-          const heading = document.createElement('div');
-          heading.className = 'md-heading md-h1';
-          heading.innerHTML = renderInlineMarkdown(trimmed.slice(2));
-          fragment.appendChild(heading);
-          continue;
-        }
-
-        if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
-          flushParagraph();
-          const list = document.createElement('ul');
-          while (i < lines.length) {
-            const current = lines[i].trim();
-            if (!(current.startsWith('- ') || current.startsWith('* '))) {
-              break;
-            }
-            const item = document.createElement('li');
-            item.innerHTML = renderInlineMarkdown(current.slice(2));
-            list.appendChild(item);
-            i += 1;
-          }
-          i -= 1;
-          fragment.appendChild(list);
-          continue;
-        }
-
-        paragraph.push(trimmed);
-      }
-
-      flushParagraph();
-
-      if (fragment.childNodes.length === 0) {
-        const fallback = document.createElement('div');
-        fallback.className = 'md-paragraph';
-        fallback.textContent = '';
-        fragment.appendChild(fallback);
-      }
-
-      return fragment;
-    };
-
-    const appendCodeBlock = (card, code, language = 'python') => {
-      card.appendChild(createCodeBlockElement(code, language));
-    };
-
-    const showLoading = () => {
-      if (state.loadingLog) {
-        return;
-      }
-      state.loadingLog = addLog('Loading...', 'loading');
-    };
-
-    const hideLoading = () => {
-      if (!state.loadingLog) {
-        return;
-      }
-      state.loadingLog.remove();
-      state.loadingLog = null;
-    };
-
-    const clearTaskInputs = () => {
-      problemInput.value = '';
-      testPathInput.value = '';
-    };
-
-    const pushField = (parts, label, value) => {
-      if (value === undefined || value === null) {
-        return;
-      }
-      const text = String(value).trim();
-      if (!text || text === 'null' || text === 'undefined') {
-        return;
-      }
-      parts.push(label + ': ' + text);
-    };
-
-    const formatTaskRequest = (problem, testFilePath, profileId) => {
-      const parts = ['### User Request'];
-      const prompt = String(problem ?? '').trim();
-      const path = String(testFilePath ?? '').trim();
-
-      if (prompt) {
-        parts.push('- Prompt:');
-        parts.push(prompt);
-      } else {
-        parts.push('- Prompt: (empty)');
-      }
-
-      if (path) {
-        parts.push('- Test File: ' + path);
-      }
-
-      const profile = findProfile(profileId);
-      if (profile && typeof profile.name === 'string' && profile.name.trim()) {
-        parts.push('- Profile: ' + profile.name.trim());
-      }
-
-      return parts.join('\\n');
-    };
-
-    const formatSuccessResult = (result, passed) => {
-      const parts = ['### Result', '- Status: ' + (passed ? 'passed' : 'failed')];
-
-      if (!result || typeof result !== 'object' || Array.isArray(result)) {
-        return parts.join('\\n');
-      }
-
-      const topFields = [];
-      pushField(topFields, 'Stage', result.stage);
-      pushField(topFields, 'Message', result.message);
-      for (const field of topFields) {
-        parts.push('- ' + field);
-      }
-
-      const testResult = result.code_test_res_dict;
-      if (testResult && typeof testResult === 'object' && !Array.isArray(testResult)) {
-        const testParts = [];
-        if (typeof testResult.passed === 'boolean') {
-          testParts.push('Passed: ' + (testResult.passed ? 'true' : 'false'));
-        }
-        pushField(testParts, 'Stage', testResult.stage);
-        pushField(testParts, 'Error Type', testResult.error_type ?? testResult.errorType ?? testResult.type);
-        pushField(testParts, 'Error', testResult.error);
-        pushField(testParts, 'Traceback', testResult.traceback);
-
-        if (testParts.length > 0) {
-          parts.push('- Test Result:');
-          for (const line of testParts) {
-            parts.push('  - ' + line);
-          }
-        }
-      }
-
-      return parts.join('\\n');
-    };
-
-    const formatFailureReason = (data) => {
-      const reason = typeof data.failureReason === 'string' ? data.failureReason.trim() : '';
-      const isRetryExhausted = /(?:after\\s*10\\s*attempts?|10\\s*attempts?)/i.test(reason);
-      if (reason && isRetryExhausted) {
-        return ['### Failure', '- Error: ' + reason].join('\\n');
-      }
-
-      const result = data.result;
-      if (result && typeof result === 'object' && !Array.isArray(result)) {
-        const error = [result.error, result.reason, result.message, reason].find((item) => typeof item === 'string' && item.trim());
-        const errorType = [result.type, result.errorType, result.error_type, result.exception_type, result.exception].find((item) => typeof item === 'string' && item.trim());
-        const traceback = [result.traceback, result.stack, result.stderr].find((item) => typeof item === 'string' && item.trim());
-
-        const parts = ['### Failure'];
-        if (typeof error === 'string' && error.trim()) {
-          parts.push('- Error: ' + error.trim());
-        }
-        if (typeof errorType === 'string' && errorType.trim()) {
-          parts.push('- Type: ' + errorType.trim());
-        }
-        if (typeof traceback === 'string' && traceback.trim()) {
-          parts.push('- Traceback:');
-          parts.push(traceback.trim());
-        }
-
-        if (parts.length > 1) {
-          return parts.join('\\n');
-        }
-      }
-
-      if (reason) {
-        return ['### Failure', '- Error: ' + reason].join('\\n');
-      }
-
-      return ['### Failure', '- Error: Workflow failed without a detailed reason.'].join('\\n');
-    };
-
-    const setRunning = (running) => {
-      const wasRunning = state.running;
-      state.running = running;
-      document.getElementById('runBtn').disabled = running;
-      statusText.textContent = running ? 'Loading...' : 'Idle';
-
-      if (running && !wasRunning) {
-        state.taskCounter += 1;
-        addTaskSeparator(state.taskCounter);
-        if (state.pendingTaskRequest) {
-          addLog(state.pendingTaskRequest, 'user-request');
-          state.pendingTaskRequest = '';
-        }
-      }
-
-      if (running) {
-        showLoading();
-      } else {
-        hideLoading();
-      }
-    };
-
-    const renderProfileOptions = () => {
-      const currentTask = taskProfileSelect.value;
-      const currentSettings = settingsProfileSelect.value;
-
-      taskProfileSelect.innerHTML = '';
-      settingsProfileSelect.innerHTML = '';
-
-      state.profiles.forEach((profile) => {
-        const taskOption = document.createElement('option');
-        taskOption.value = profile.id;
-        taskOption.textContent = profile.name + ' (' + profile.provider + ')';
-        taskProfileSelect.appendChild(taskOption);
-
-        const settingsOption = document.createElement('option');
-        settingsOption.value = profile.id;
-        settingsOption.textContent = profile.name;
-        settingsProfileSelect.appendChild(settingsOption);
-      });
-
-      const active = state.activeProfileId || state.profiles[0]?.id || '';
-      taskProfileSelect.value = state.profiles.some((p) => p.id === currentTask) ? currentTask : active;
-      settingsProfileSelect.value = state.profiles.some((p) => p.id === currentSettings) ? currentSettings : active;
-    };
-
-    const loadProfileEditor = () => {
-      if (!state.editingProfileId) {
-        profileNameInput.value = 'New Profile';
-        profileBaseUrlInput.value = '';
-        profileModelInput.value = 'gpt-5.4';
-        profileProviderSelect.value = 'other';
-        profileApiKeyInput.value = '';
-        profileHint.textContent = 'Create a new profile and save it.';
-        return;
-      }
-
-      const profile = findProfile(state.editingProfileId);
-      if (!profile) {
-        profileNameInput.value = '';
-        profileBaseUrlInput.value = '';
-        profileModelInput.value = 'gpt-5.4';
-        profileProviderSelect.value = 'other';
-        profileApiKeyInput.value = '';
-        profileHint.textContent = 'Selected profile not found.';
-        return;
-      }
-
-      profileNameInput.value = profile.name;
-      profileBaseUrlInput.value = profile.baseUrl;
-      profileModelInput.value = profile.model;
-      profileProviderSelect.value = profile.provider || 'other';
-      profileApiKeyInput.value = profile.apiKey;
-      profileHint.textContent = profile.apiKey ? 'API key is set for this profile.' : 'API key is empty for this profile.';
-    };
-
-    const startNewProfile = (returnToTask) => {
-      state.editingProfileId = '';
-      state.returnToTaskAfterSave = returnToTask;
-      loadProfileEditor();
-      switchPage('settings');
-    };
-
-    taskTabBtn.addEventListener('click', () => switchPage('task'));
-    settingsTabBtn.addEventListener('click', () => switchPage('settings'));
-
-    document.getElementById('showOutputBtn').addEventListener('click', () => {
-      vscode.postMessage({ type: 'showOutput' });
-    });
-
-    taskProfileSelect.addEventListener('change', () => {
-      const profileId = taskProfileSelect.value;
-      state.activeProfileId = profileId;
-      vscode.postMessage({ type: 'switchProfile', profileId });
-    });
-
-    settingsProfileSelect.addEventListener('change', () => {
-      state.editingProfileId = settingsProfileSelect.value;
-      loadProfileEditor();
-    });
-
-    document.getElementById('newProfileFromTaskBtn').addEventListener('click', () => {
-      startNewProfile(true);
-    });
-
-    document.getElementById('newProfileBtn').addEventListener('click', () => {
-      startNewProfile(false);
-    });
-
-    document.getElementById('openProfileConfigBtn').addEventListener('click', () => {
-      vscode.postMessage({ type: 'openProfileConfig' });
-    });
-
-    document.getElementById('reloadProfilesBtn').addEventListener('click', () => {
-      vscode.postMessage({ type: 'reloadProfiles' });
-    });
-
-    document.getElementById('saveProfileBtn').addEventListener('click', () => {
-      vscode.postMessage({
-        type: 'saveProfile',
-        id: state.editingProfileId,
-        name: profileNameInput.value,
-        baseUrl: profileBaseUrlInput.value,
-        model: profileModelInput.value,
-        provider: profileProviderSelect.value,
-        apiKey: profileApiKeyInput.value
-      });
-      if (state.returnToTaskAfterSave) {
-        switchPage('task');
-        state.returnToTaskAfterSave = false;
-      }
-    });
-
-    document.getElementById('deleteProfileBtn').addEventListener('click', () => {
-      if (!state.editingProfileId) {
-        addLog('No profile selected for deletion.', 'error');
-        return;
-      }
-      vscode.postMessage({
-        type: 'deleteProfile',
-        id: state.editingProfileId
-      });
-    });
-
-    document.getElementById('pickTestPathBtn').addEventListener('click', () => {
-      vscode.postMessage({ type: 'selectTestFile' });
-    });
-
-    document.getElementById('useSelectionBtn').addEventListener('click', () => {
-      vscode.postMessage({ type: 'useEditorSelection' });
-    });
-
-    document.getElementById('runBtn').addEventListener('click', () => {
-      const problem = problemInput.value;
-      const testFilePath = testPathInput.value;
-      const profileId = taskProfileSelect.value;
-      state.pendingTaskRequest = formatTaskRequest(problem, testFilePath, profileId);
-
-      vscode.postMessage({
-        type: 'runWorkflow',
-        problem,
-        testFilePath
-      });
-    });
-
-    problemInput.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' && !event.shiftKey) {
-        event.preventDefault();
-        if (!state.running) {
-          document.getElementById('runBtn').click();
-        }
-      }
-    });
-
-    window.addEventListener('message', (event) => {
-      const data = event.data;
-      if (!data || typeof data.type !== 'string') {
-        return;
-      }
-
-      switch (data.type) {
-        case 'switchPage':
-          if (data.page === 'settings') {
-            switchPage('settings');
-          } else {
-            switchPage('task');
-          }
-          break;
-        case 'state': {
-          state.profiles = Array.isArray(data.profiles) ? data.profiles : [];
-          state.activeProfileId = typeof data.activeProfileId === 'string' ? data.activeProfileId : '';
-          renderProfileOptions();
-
-          if (!state.editingProfileId || !findProfile(state.editingProfileId)) {
-            state.editingProfileId = state.activeProfileId || (state.profiles[0]?.id || '');
-          }
-          loadProfileEditor();
-          break;
-        }
-        case 'prefillProblem':
-          if (typeof data.problem === 'string') {
-            problemInput.value = data.problem;
-          }
-          break;
-        case 'setTestPath':
-          if (typeof data.testFilePath === 'string') {
-            testPathInput.value = data.testFilePath;
-          }
-          break;
-        case 'runState':
-          setRunning(Boolean(data.running));
-          break;
-        case 'log':
-          if (typeof data.text === 'string') {
-            const level = typeof data.level === 'string' ? data.level : 'info';
-            addLog(data.text, level);
-          }
-          break;
-        case 'workflowError': {
-          hideLoading();
-          clearTaskInputs();
-          const reason = typeof data.reason === 'string' && data.reason.trim()
-            ? data.reason.trim()
-            : 'Workflow failed without a detailed reason.';
-          addLog(['### Failure', '- Error: ' + reason].join('\\n'), 'result-fail');
-          break;
-        }
-        case 'workflowResult': {
-          hideLoading();
-          clearTaskInputs();
-          const passed = Boolean(data.passed);
-
-          if (!passed) {
-            addLog(formatFailureReason(data), 'result-fail');
-            break;
-          }
-
-          addLog(formatSuccessResult(data.result, passed), 'result-pass');
-
-          if (typeof data.code === 'string' && data.code.trim()) {
-            addLog(['### Code', mdFence + 'python', data.code, mdFence].join('\\n'), 'code-block');
-          }
-          break;
-        }
-        default:
-          break;
-      }
-    });
-
-    vscode.postMessage({ type: 'ready' });
-  </script>
+	<div class="app-shell">
+		<header class="app-header">
+			<div class="brand">
+				<div class="brand-title">${EXTENSION_DISPLAY_NAME}</div>
+				<div class="brand-subtitle">Workflow</div>
+			</div>
+			<div class="header-actions">
+				<button class="btn subtle" id="showOutputBtn" type="button">Logs</button>
+				<button class="btn subtle" id="openSettingsBtn" type="button">Profiles</button>
+			</div>
+		</header>
+
+		<main class="page active" id="taskPage">
+			<section class="setup-shell">
+				<div class="section-header">
+					<div>
+						<div class="panel-title">Setup</div>
+						<div class="panel-copy">Keep model settings and test setup here before you send the next task.</div>
+					</div>
+				</div>
+				<div class="setup-grid">
+					<section class="setup-block">
+						<div class="setup-block-header">
+							<div class="mini-heading">Model</div>
+							<div class="hint">Profile and context behavior for the next run.</div>
+						</div>
+						<div class="field compact-field">
+							<label for="taskProfileSelect">LLM Profile</label>
+							<select id="taskProfileSelect"></select>
+						</div>
+						<label class="checkbox-chip" for="contextEnabledInput">
+							<input id="contextEnabledInput" type="checkbox" />
+							<span>Use Context</span>
+						</label>
+					</section>
+
+					<section class="setup-block">
+						<div class="setup-block-header">
+							<div class="panel-header">
+								<div>
+									<div class="mini-heading">Tests</div>
+									<div class="hint">Manual tests run directly. Generated tests stay isolated from workflow context.</div>
+								</div>
+								<div class="field compact-field narrow-field">
+									<label for="testModeSelect">Test Mode</label>
+									<select id="testModeSelect">
+										<option value="manual">Manual Tests</option>
+										<option value="generate">Generate Tests</option>
+									</select>
+								</div>
+							</div>
+						</div>
+						<textarea id="testInput" placeholder="Paste Python tests here, or describe the checks you want the model to turn into runnable tests."></textarea>
+						<div class="action-row">
+							<button class="btn secondary" id="useSelectionForTestsBtn" type="button">Selection To Tests</button>
+						</div>
+						<div class="generated-tests-shell hidden" id="testsWorkspaceSection">
+							<div class="generated-tests-header">
+								<div class="mini-heading">Generated Test Suite</div>
+								<div class="hint" id="resolvedTestsHint">Switch to generated tests mode to work with a separate editable test suite.</div>
+							</div>
+							<textarea id="resolvedTestsEditor" placeholder="Generated runnable tests will appear here. You can edit them before saving."></textarea>
+							<div class="action-row">
+								<button class="btn secondary" id="generateTestsBtn" type="button">Generate Tests</button>
+								<button class="btn secondary" id="saveResolvedTestsBtn" type="button">Save Test Code</button>
+							</div>
+						</div>
+					</section>
+				</div>
+			</section>
+
+			<section class="conversation-shell">
+				<div class="section-header conversation-header">
+					<div>
+						<div class="panel-title">Conversation</div>
+						<div class="panel-copy">Requirements, code, run results, and plans appear here in order.</div>
+					</div>
+				</div>
+				<div class="conversation-scroll">
+					<div class="timeline" id="timeline"></div>
+				</div>
+			</section>
+
+			<section class="composer-shell">
+				<textarea id="problemInput" placeholder="Describe the coding task, constraints, expected behavior, and anything the model must preserve."></textarea>
+				<div class="composer-row">
+					<button class="btn secondary" id="useSelectionForProblemBtn" type="button">Selection To Prompt</button>
+					<select id="executionModeSelect" aria-label="Execution Mode">
+						<option value="auto">Auto Full Workflow</option>
+						<option value="continue">Interactive Continue</option>
+					</select>
+					<button class="btn" id="submitWorkflowBtn" type="button">Send</button>
+					<button class="btn secondary" id="resumeWorkflowBtn" type="button">Resume</button>
+					<button class="btn secondary" id="interruptWorkflowBtn" type="button">Stop</button>
+					<button class="btn subtle" id="clearSessionBtn" type="button">New Task</button>
+				</div>
+				<div class="composer-status" id="composerStatus" aria-live="polite"></div>
+				<div class="composer-note">Press Ctrl/Cmd+Enter to send. Stop pauses after the current stage. Resume continues a paused workflow. New Task clears the current session.</div>
+			</section>
+		</main>
+
+		<main class="page" id="settingsPage">
+			<section class="panel">
+				<div class="panel-header">
+					<div>
+						<div class="panel-title">Profile Settings</div>
+						<div class="panel-copy">Manage OpenAI-compatible, Claude, Ollama, or vLLM profiles. The active profile is used by the workflow page.</div>
+					</div>
+					<button class="btn subtle" id="backToWorkflowBtn" type="button">Back</button>
+				</div>
+
+				<div class="form-grid">
+					<div class="field span-2">
+						<label for="settingsProfileSelect">Edit Profile</label>
+						<select id="settingsProfileSelect"></select>
+					</div>
+					<div class="field">
+						<label for="profileNameInput">Profile Name</label>
+						<input id="profileNameInput" type="text" placeholder="Local GPT-5.4" />
+					</div>
+					<div class="field">
+						<label for="profileProviderSelect">Provider</label>
+						<select id="profileProviderSelect">
+							<option value="other">OpenAI-Compatible</option>
+							<option value="openai">OpenAI</option>
+							<option value="claude">Claude</option>
+							<option value="ollama">Ollama</option>
+							<option value="vllm">vLLM</option>
+						</select>
+					</div>
+					<div class="field">
+						<label for="profileBaseUrlInput">Base URL</label>
+						<input id="profileBaseUrlInput" type="text" placeholder="https://api.openai.com/v1" />
+					</div>
+					<div class="field">
+						<label for="profileModelInput">Model</label>
+						<input id="profileModelInput" type="text" placeholder="gpt-5.4" />
+					</div>
+					<div class="field span-2">
+						<label for="profileApiKeyInput">API Key</label>
+						<input id="profileApiKeyInput" type="password" placeholder="sk-..." />
+						<div class="field-hint">Optional for Ollama and vLLM. Required for hosted providers.</div>
+					</div>
+				</div>
+
+				<div class="hint" id="profileHint">Create a new profile and save it.</div>
+
+				<div class="button-grid">
+					<button class="btn secondary" id="newProfileBtn" type="button">New Profile</button>
+					<button class="btn secondary" id="openProfileConfigBtn" type="button">Open Config</button>
+					<button class="btn secondary" id="reloadProfilesBtn" type="button">Reload Profiles</button>
+					<button class="btn secondary" id="deleteProfileBtn" type="button">Delete Profile</button>
+					<button class="btn" id="saveProfileBtn" type="button">Save Profile</button>
+				</div>
+			</section>
+		</main>
+	</div>
+
+	<script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
 }

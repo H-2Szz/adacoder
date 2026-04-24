@@ -1,7 +1,7 @@
 {
-  "name": "adacoder",
-  "displayName": "Adacoder",
-  "description": "adcoder",
+  "name": "adaassist",
+  "displayName": "AdaAssist",
+  "description": "Programming assistant for code workflows in VS Code.",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.110.0"
@@ -10,41 +10,41 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:adacoder.openChat",
-    "onCommand:adacoder.openSettings",
-    "onCommand:adacoder.openProfileConfig",
-    "onCommand:adacoder.runWorkflow",
-    "onCommand:adacoder.runFromSelection",
-    "onView:adacoder.sidebarView"
+    "onCommand:adaassist.openChat",
+    "onCommand:adaassist.openSettings",
+    "onCommand:adaassist.openProfileConfig",
+    "onCommand:adaassist.runWorkflow",
+    "onCommand:adaassist.runFromSelection",
+    "onView:adaassist.sidebarView"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "adacoder.openChat",
-        "title": "Adacoder: Open Chat"
+        "command": "adaassist.openChat",
+        "title": "AdaAssist: Open Chat"
       },
       {
-        "command": "adacoder.openSettings",
-        "title": "Adacoder: Open Settings"
+        "command": "adaassist.openSettings",
+        "title": "AdaAssist: Open Settings"
       },
       {
-        "command": "adacoder.openProfileConfig",
-        "title": "Adacoder: Open Profile Config File"
+        "command": "adaassist.openProfileConfig",
+        "title": "AdaAssist: Open Profile Config File"
       },
       {
-        "command": "adacoder.runWorkflow",
-        "title": "Adacoder: Open Chat (Legacy Command)"
+        "command": "adaassist.runWorkflow",
+        "title": "AdaAssist: Open Chat"
       },
       {
-        "command": "adacoder.runFromSelection",
-        "title": "Adacoder: Generate From Selection"
+        "command": "adaassist.runFromSelection",
+        "title": "AdaAssist: Generate From Selection"
       }
     ],
     "menus": {
       "editor/context": [
         {
-          "command": "adacoder.runFromSelection",
+          "command": "adaassist.runFromSelection",
           "when": "editorHasSelection",
           "group": "navigation@100"
         }
@@ -53,45 +53,60 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "adacoder-sidebar",
-          "title": "Adacoder",
-          "icon": "media/adacoder.svg"
+          "id": "adaassist-sidebar",
+          "title": "AdaAssist",
+          "icon": "media/adaassist.svg"
         }
       ]
     },
     "views": {
-      "adacoder-sidebar": [
+      "adaassist-sidebar": [
         {
-          "id": "adacoder.sidebarView",
+          "id": "adaassist.sidebarView",
           "name": "Chat",
           "type": "webview"
         }
       ]
     },
     "configuration": {
-      "title": "Adacoder",
+      "title": "AdaAssist",
       "properties": {
-        "adacoder.pythonPath": {
+        "adaassist.pythonPath": {
           "type": "string",
           "default": "python3",
           "description": "Python executable. Supports command (python3), absolute path, relative path, ${workspaceFolder} and ${extensionPath}."
         },
-        "adacoder.bridgePath": {
+        "adaassist.backendPath": {
+          "type": "string",
+          "default": "backend/main.py",
+          "description": "Path to the FastAPI backend entry file. Supports absolute path, relative path, ${workspaceFolder} and ${extensionPath}."
+        },
+        "adaassist.backendHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host used when starting the bundled FastAPI backend."
+        },
+        "adaassist.backendPort": {
+          "type": "number",
+          "default": 8765,
+          "description": "Port used when starting the bundled FastAPI backend."
+        },
+        "adaassist.bridgePath": {
           "type": "string",
           "default": "backend/bridge.py",
-          "description": "Path to bridge.py. Supports absolute path, relative path, ${workspaceFolder} and ${extensionPath}."
+          "description": "Legacy bridge.py path kept for compatibility with older workspace settings."
         },
-        "adacoder.profileConfigPath": {
+        "adaassist.profileConfigPath": {
           "type": "string",
-          "default": ".vscode/adacoder-profiles.json",
+          "default": ".vscode/adaassist-profiles.json",
           "description": "Path to profile JSON config file. Supports absolute path, relative path, ${workspaceFolder} and ${extensionPath}."
         },
-        "adacoder.baseUrl": {
+        "adaassist.baseUrl": {
           "type": "string",
           "default": "",
           "description": "Default LLM base_url sent to backend."
         },
-        "adacoder.model": {
+        "adaassist.model": {
           "type": "string",
           "default": "gpt-5.4",
           "description": "Default model name sent to backend."

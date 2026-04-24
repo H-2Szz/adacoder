@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "activeProfileId": "default",
+  "activeProfileId": "ollama-local-8328",
   "profiles": [
     {
       "id": "default",
