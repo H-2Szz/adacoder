@@ -22,6 +22,7 @@ interface BackendSessionRequest extends WorkflowArgs {
 	llm: LlmRequestConfig;
 	context_enabled: boolean;
 	max_rounds: number;
+	resolved_test_code?: string;
 }
 
 interface BackendSessionState {
@@ -88,6 +89,7 @@ interface RunRequest {
 	contextEnabled: boolean;
 	maxRounds: number;
 	executionMode: 'auto' | 'continue';
+	resolvedTestCode?: string;
 }
 
 type InteractionState = 'idle' | 'await_plan' | 'await_failure_choice' | 'done';
@@ -101,6 +103,7 @@ interface ActionRequestState {
 	maxRounds?: number;
 	planOverride?: string;
 	executionMode?: 'auto' | 'continue';
+	resolvedTestCode?: string;
 }
 
 type ResumeState =
@@ -545,7 +548,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 					await this.postState();
 					break;
 				}
-				case 'switchProfile': {
+					case 'switchProfile': {
 					const profileId = typeof message.profileId === 'string' ? message.profileId : '';
 					if (!profileId) {
 						break;
@@ -558,25 +561,26 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 					await this.persistProfiles(context);
 					await this.postState();
 					break;
-				}
-				case 'saveProfile': {
-					await this.saveProfile(context, message);
-					break;
-				}
-				case 'deleteProfile': {
-					await this.deleteProfile(context, message);
-					break;
-				}
-				case 'runWorkflow': {
-					const problem = typeof message.problem === 'string' ? message.problem : '';
-					const testText = typeof message.testText === 'string' ? message.testText : '';
-					const testMode: TestMode = message.testMode === 'generate' ? 'generate' : 'manual';
-					const contextEnabled = typeof message.contextEnabled === 'boolean' ? message.contextEnabled : false;
-					const maxRounds = typeof message.maxRounds === 'number' ? message.maxRounds : 10;
-					const executionMode = message.executionMode === 'continue' ? 'continue' : 'auto';
-					await this.executeWorkflow(context, { problem, testText, testMode, contextEnabled, maxRounds, executionMode });
-					break;
-				}
+					}
+					case 'saveProfile': {
+						await this.saveProfile(context, message);
+						break;
+					}
+					case 'deleteProfile': {
+						await this.deleteProfile(context, message);
+						break;
+					}
+					case 'runWorkflow': {
+						const problem = typeof message.problem === 'string' ? message.problem : '';
+						const testText = typeof message.testText === 'string' ? message.testText : '';
+						const testMode: TestMode = message.testMode === 'generate' ? 'generate' : 'manual';
+						const contextEnabled = typeof message.contextEnabled === 'boolean' ? message.contextEnabled : false;
+						const maxRounds = typeof message.maxRounds === 'number' ? message.maxRounds : 10;
+						const executionMode = message.executionMode === 'continue' ? 'continue' : 'auto';
+						const resolvedTestCode = typeof message.resolvedTestCode === 'string' ? message.resolvedTestCode : undefined;
+						await this.executeWorkflow(context, { problem, testText, testMode, contextEnabled, maxRounds, executionMode, resolvedTestCode });
+						break;
+					}
 				case 'interruptWorkflow': {
 					await this.interruptWorkflow();
 					break;
@@ -787,7 +791,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 				provider: profile.provider
 			},
 			context_enabled: request.contextEnabled,
-			max_rounds: request.maxRounds
+			max_rounds: request.maxRounds,
+			resolved_test_code: request.testMode === 'generate' ? request.resolvedTestCode?.trim() : undefined
 		};
 	}
 
@@ -813,6 +818,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 		maxRounds?: number;
 		planOverride?: string;
 		executionMode?: 'auto' | 'continue';
+		resolvedTestCode?: string;
 	} {
 		const testMode: TestMode | undefined = message.testMode === 'generate'
 			? 'generate'
@@ -829,7 +835,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			contextEnabled: typeof message.contextEnabled === 'boolean' ? message.contextEnabled : undefined,
 			maxRounds: typeof message.maxRounds === 'number' ? message.maxRounds : undefined,
 			planOverride: typeof message.planOverride === 'string' ? message.planOverride : undefined,
-			executionMode
+			executionMode,
+			resolvedTestCode: typeof message.resolvedTestCode === 'string' ? message.resolvedTestCode : undefined
 		};
 	}
 
@@ -990,19 +997,20 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			return;
 		}
 
-		const payload = await this.backendServer.request<BackendResponse>(
-			`/api/sessions/${this.activeSession.session_id}`,
-			{
-				method: 'PATCH',
-				body: JSON.stringify({
-					problem: request.problem.trim(),
-					test_text: request.testText.trim(),
-					test_mode: request.testMode,
-					context_enabled: request.contextEnabled,
-					max_rounds: request.maxRounds
-				})
-			}
-		);
+			const payload = await this.backendServer.request<BackendResponse>(
+				`/api/sessions/${this.activeSession.session_id}`,
+				{
+					method: 'PATCH',
+					body: JSON.stringify({
+						problem: request.problem.trim(),
+						test_text: request.testText.trim(),
+						test_mode: request.testMode,
+						context_enabled: request.contextEnabled,
+						max_rounds: request.maxRounds,
+						resolved_test_code: request.testMode === 'generate' ? request.resolvedTestCode?.trim() : undefined
+					})
+				}
+			);
 		this.activeSession = payload.session;
 		this.workflowMode = request.executionMode;
 		await this.postState();
@@ -1010,13 +1018,14 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 	}
 
 	private async ensureSessionForStandaloneTestAction(request: {
-		problem?: string;
-		testText?: string;
-		testMode?: TestMode;
-		contextEnabled?: boolean;
-		maxRounds?: number;
-		executionMode?: 'auto' | 'continue';
-	}): Promise<boolean> {
+			problem?: string;
+			testText?: string;
+			testMode?: TestMode;
+			contextEnabled?: boolean;
+			maxRounds?: number;
+			executionMode?: 'auto' | 'continue';
+			resolvedTestCode?: string;
+		}): Promise<boolean> {
 		if (this.activeSession?.session_id) {
 			return true;
 		}
@@ -1027,7 +1036,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			testMode: request.testMode ?? 'generate',
 			contextEnabled: request.contextEnabled ?? false,
 			maxRounds: request.maxRounds ?? 10,
-			executionMode: request.executionMode ?? this.workflowMode
+			executionMode: request.executionMode ?? this.workflowMode,
+			resolvedTestCode: request.resolvedTestCode
 		};
 		const profile = this.validateRunRequest(draftRequest);
 		if (!profile) {
@@ -1085,23 +1095,24 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			return;
 		}
 
-		await this.runGuarded(
-			request.executionMode === 'auto' ? 'Starting auto workflow...' : 'Starting interactive workflow...',
-			'Execution failed',
-			async () => {
-			this.clearResumeState();
-			this.interruptRequested = false;
-			const hadSession = Boolean(this.activeSession?.session_id);
-			await this.syncWorkflowSession(profile, request);
+			await this.runGuarded(
+				request.executionMode === 'auto' ? 'Starting auto workflow...' : 'Starting interactive workflow...',
+				'Execution failed',
+				async () => {
+					this.clearResumeState();
+					this.interruptRequested = false;
+					const hadSession = Boolean(this.activeSession?.session_id);
+					await this.syncWorkflowSession(profile, request);
 
 				if (request.executionMode === 'auto') {
 					this.setRunState(true, 'Running the full workflow until the retry limit...');
 					const payload = await this.invokeWorkflowAction({
-					action: 'auto',
-					useErrorFeedback: true,
-					contextEnabled: request.contextEnabled,
-					maxRounds: request.maxRounds
-				});
+						action: 'auto',
+						useErrorFeedback: true,
+						contextEnabled: request.contextEnabled,
+						maxRounds: request.maxRounds,
+						resolvedTestCode: request.resolvedTestCode
+					});
 					if (payload.stage_result?.interrupted) {
 						this.resumeState = { kind: 'auto', request };
 						this.interruptRequested = false;
@@ -1112,16 +1123,17 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 					return;
 				}
 
-				this.setRunState(true, hadSession ? 'Restarting the current workflow from the latest setup...' : 'Generating initial code...');
-				await this.invokeWorkflowAction({
-					action: hadSession ? 'restart' : 'generate',
-					problem: request.problem,
-					testText: request.testText,
-					testMode: request.testMode,
-					useErrorFeedback: !hadSession,
-					contextEnabled: request.contextEnabled,
-					maxRounds: request.maxRounds
-				});
+					this.setRunState(true, hadSession ? 'Restarting the current workflow from the latest setup...' : 'Generating initial code...');
+					await this.invokeWorkflowAction({
+						action: hadSession ? 'restart' : 'generate',
+						problem: request.problem,
+						testText: request.testText,
+						testMode: request.testMode,
+						useErrorFeedback: !hadSession,
+						contextEnabled: request.contextEnabled,
+						maxRounds: request.maxRounds,
+						resolvedTestCode: request.resolvedTestCode
+					});
 				if (await this.pauseIfInterrupted(
 					{ kind: 'interactive-initial-evaluate', request },
 					'Interactive workflow paused after code generation. Resume to run evaluation.'
@@ -1129,16 +1141,17 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 					return;
 				}
 
-				this.setRunState(true, 'Evaluating generated code...');
-				await this.invokeWorkflowAction({
-					action: 'evaluate',
-					problem: request.problem,
-					testText: request.testText,
-					testMode: request.testMode,
-					useErrorFeedback: true,
-					contextEnabled: request.contextEnabled,
-					maxRounds: request.maxRounds
-				});
+					this.setRunState(true, 'Evaluating generated code...');
+					await this.invokeWorkflowAction({
+						action: 'evaluate',
+						problem: request.problem,
+						testText: request.testText,
+						testMode: request.testMode,
+						useErrorFeedback: true,
+						contextEnabled: request.contextEnabled,
+						maxRounds: request.maxRounds,
+						resolvedTestCode: request.resolvedTestCode
+					});
 
 				this.interruptRequested = false;
 				if (this.activeSession?.passed) {
@@ -1163,6 +1176,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			contextEnabled?: boolean;
 			maxRounds?: number;
 			planOverride?: string;
+			resolvedTestCode?: string;
 		}
 	): Promise<void> {
 		if (!this.activeSession?.session_id) {
@@ -1182,7 +1196,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 				useErrorFeedback: true,
 				contextEnabled: request.contextEnabled,
 				maxRounds: request.maxRounds,
-				planOverride: request.planOverride
+				planOverride: request.planOverride,
+				resolvedTestCode: request.resolvedTestCode
 			});
 			if (await this.pauseIfInterrupted(
 				{ kind: 'interactive-plan-evaluate', request },
@@ -1199,7 +1214,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 				testMode: request.testMode,
 				useErrorFeedback: true,
 				contextEnabled: request.contextEnabled,
-				maxRounds: request.maxRounds
+				maxRounds: request.maxRounds,
+				resolvedTestCode: request.resolvedTestCode
 			});
 
 			this.interruptRequested = false;
@@ -1218,6 +1234,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			contextEnabled?: boolean;
 			maxRounds?: number;
 			planOverride?: string;
+			resolvedTestCode?: string;
 		}
 	): Promise<void> {
 		if (!this.activeSession?.session_id) {
@@ -1237,7 +1254,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 				useErrorFeedback: true,
 				contextEnabled: request.contextEnabled,
 				maxRounds: request.maxRounds,
-				planOverride: request.planOverride
+				planOverride: request.planOverride,
+				resolvedTestCode: request.resolvedTestCode
 			});
 			this.interruptRequested = false;
 			this.interactiveState = 'await_plan';
@@ -1255,6 +1273,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			contextEnabled?: boolean;
 			maxRounds?: number;
 			planOverride?: string;
+			resolvedTestCode?: string;
 		}
 	): Promise<void> {
 		if (!this.activeSession?.session_id) {
@@ -1273,7 +1292,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 				testMode: request.testMode,
 				useErrorFeedback: false,
 				contextEnabled: request.contextEnabled,
-				maxRounds: request.maxRounds
+				maxRounds: request.maxRounds,
+				resolvedTestCode: request.resolvedTestCode
 			});
 			if (await this.pauseIfInterrupted(
 				{ kind: 'interactive-restart-evaluate', request },
@@ -1290,7 +1310,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 				testMode: request.testMode,
 				useErrorFeedback: false,
 				contextEnabled: request.contextEnabled,
-				maxRounds: request.maxRounds
+				maxRounds: request.maxRounds,
+				resolvedTestCode: request.resolvedTestCode
 			});
 
 			this.interruptRequested = false;
@@ -1327,6 +1348,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			maxRounds?: number;
 			planOverride?: string;
 			executionMode?: 'auto' | 'continue';
+			resolvedTestCode?: string;
 		}
 	): Promise<void> {
 		await this.runGuarded(`Running ${request.action}...`, 'Action failed', async () => {
@@ -1337,7 +1359,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 					testMode: request.testMode,
 					contextEnabled: request.contextEnabled,
 					maxRounds: request.maxRounds,
-					executionMode: request.executionMode
+					executionMode: request.executionMode,
+					resolvedTestCode: request.resolvedTestCode
 				});
 				if (!ready) {
 					return;
@@ -1351,7 +1374,8 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 				useErrorFeedback: request.useErrorFeedback,
 				contextEnabled: request.contextEnabled,
 				maxRounds: request.maxRounds,
-				planOverride: request.planOverride
+				planOverride: request.planOverride,
+				resolvedTestCode: request.resolvedTestCode
 			});
 			if (request.action === 'plan' && this.workflowMode === 'continue') {
 				this.interactiveState = 'await_plan';
@@ -1966,19 +1990,22 @@ function getChatHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string 
 								</div>
 							</div>
 						</div>
-						<textarea id="testInput" placeholder="Paste Python tests here, or describe the checks you want the model to turn into runnable tests."></textarea>
-						<div class="action-row">
-							<button class="btn secondary" id="useSelectionForTestsBtn" type="button">Selection To Tests</button>
+						<div class="manual-tests-shell" id="manualTestsSection">
+							<textarea id="testInput" placeholder="Paste runnable Python tests here. They will run against the generated code directly."></textarea>
+							<div class="action-row">
+								<button class="btn secondary" id="useSelectionForTestsBtn" type="button">Selection To Tests</button>
+							</div>
 						</div>
 						<div class="generated-tests-shell hidden" id="testsWorkspaceSection">
 							<div class="generated-tests-header">
 								<div class="mini-heading">Generated Test Suite</div>
 								<div class="hint" id="resolvedTestsHint">Switch to generated tests mode to work with a separate editable test suite.</div>
 							</div>
-							<textarea id="resolvedTestsEditor" placeholder="Generated runnable tests will appear here. You can edit them before saving."></textarea>
+							<textarea id="resolvedTestsEditor" placeholder="Generated runnable assert tests will appear here. You can edit them before applying."></textarea>
+							<div class="generated-tests-preview" id="resolvedTestsPreview"></div>
 							<div class="action-row">
 								<button class="btn secondary" id="generateTestsBtn" type="button">Generate Tests</button>
-								<button class="btn secondary" id="saveResolvedTestsBtn" type="button">Save Test Code</button>
+								<button class="btn secondary" id="saveResolvedTestsBtn" type="button">Use Edited Tests</button>
 							</div>
 						</div>
 					</section>
@@ -1992,7 +2019,7 @@ function getChatHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string 
 						<div class="panel-copy">Requirements, code, run results, and plans appear here in order.</div>
 					</div>
 				</div>
-				<div class="conversation-scroll">
+				<div class="conversation-scroll" id="conversationScroll">
 					<div class="timeline" id="timeline"></div>
 				</div>
 			</section>

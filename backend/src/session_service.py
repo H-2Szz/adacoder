@@ -130,12 +130,13 @@ class WorkflowSession:
         self.context_entries = self.context_entries[-12:]
         self.updated_at = utc_now()
 
-    def set_resolved_test_code(self, code: str) -> None:
+    def set_resolved_test_code(self, code: str) -> bool:
         cleaned = code.strip()
         if cleaned == self.resolved_test_code:
-            return
+            return False
         self.resolved_test_code = cleaned
         self.updated_at = utc_now()
+        return True
 
     def remove_context_kinds(self, *kinds: str) -> None:
         if not kinds:
@@ -220,6 +221,7 @@ class WorkflowSession:
         max_rounds: int | None = None,
         plan: str | None = None,
         resolved_test_code: str | None = None,
+        announce_resolved_tests: bool = False,
     ) -> None:
         if context_enabled is not None and context_enabled != self.context_enabled:
             self.context_enabled = context_enabled
@@ -269,7 +271,20 @@ class WorkflowSession:
                 )
 
         if resolved_test_code is not None:
-            self.set_resolved_test_code(resolved_test_code)
+            tests_changed = self.set_resolved_test_code(resolved_test_code)
+            if self.resolved_test_code and (tests_changed or announce_resolved_tests):
+                self.add_event(
+                    stage="tests",
+                    status="ready",
+                    title="Use Edited Tests",
+                    message="The editable test suite is now selected for future evaluations.",
+                    data={
+                        "mode": self.test_mode,
+                        "test_length": len(self.resolved_test_code),
+                        "test_code": self.resolved_test_code,
+                        "edited": True,
+                    },
+                )
 
         if max_rounds is not None and max_rounds > 0:
             self.max_rounds = max_rounds
@@ -312,7 +327,7 @@ class WorkflowSession:
 
         result = self.engine.generate_tests(
             self.problem_statement,
-            test_description=self.test_text,
+            test_description="",
             context_entries=None,
         )
         if not result.get("ok"):

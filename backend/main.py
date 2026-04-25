@@ -22,6 +22,7 @@ class CreateSessionRequest(BaseModel):
     problem: str = Field(min_length=1)
     test_text: str = ""
     test_mode: Literal["manual", "generate"] = "manual"
+    resolved_test_code: str = ""
     llm: LLMSettingsRequest
     context_enabled: bool = False
     max_rounds: int = Field(default=3, ge=1, le=10)
@@ -92,6 +93,8 @@ def create_session(request: CreateSessionRequest) -> dict[str, Any]:
         context_enabled=request.context_enabled,
         max_rounds=request.max_rounds,
     )
+    if request.resolved_test_code.strip():
+        session.update_options(resolved_test_code=request.resolved_test_code)
     return ok(session.to_dict())
 
 
@@ -113,6 +116,7 @@ def update_session(session_id: str, request: UpdateSessionRequest) -> dict[str, 
             context_enabled=request.context_enabled,
             max_rounds=request.max_rounds,
             plan=request.plan,
+            announce_resolved_tests=request.resolved_test_code is not None,
         )
         return ok(session.to_dict())
 

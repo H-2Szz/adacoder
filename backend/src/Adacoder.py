@@ -32,7 +32,12 @@ class Adacoder:
 
     def _init_tester(self) -> AdacoderExecutor:
         return AdacoderExecutor(
-            system_prompt="You are an expert Python test writer.",
+            system_prompt=(
+                "You are a Python test generation assistant. "
+                "Your only job is to write runnable top-level assert tests for the requested Python task. "
+                "Never implement or redefine the candidate solution. "
+                "Output only Python test code without markdown fences."
+            ),
             LLM_Config=self.coder_config,
         )
 

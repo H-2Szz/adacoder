@@ -17,11 +17,14 @@
   const composerStatus = document.getElementById('composerStatus');
   const resumeWorkflowBtn = document.getElementById('resumeWorkflowBtn');
   const interruptWorkflowBtn = document.getElementById('interruptWorkflowBtn');
+  const conversationScroll = document.getElementById('conversationScroll');
   const timeline = document.getElementById('timeline');
 
+  const manualTestsSection = document.getElementById('manualTestsSection');
   const testsWorkspaceSection = document.getElementById('testsWorkspaceSection');
   const resolvedTestsHint = document.getElementById('resolvedTestsHint');
   const resolvedTestsEditor = document.getElementById('resolvedTestsEditor');
+  const resolvedTestsPreview = document.getElementById('resolvedTestsPreview');
   const generateTestsBtn = document.getElementById('generateTestsBtn');
   const saveResolvedTestsBtn = document.getElementById('saveResolvedTestsBtn');
 
@@ -59,8 +62,37 @@
     resumeLabel: '',
     interruptRequested: false,
     editablePlanEventId: '',
-    editablePlanText: ''
+    editablePlanText: '',
+    autoScrollPinned: true,
+    lastTimelineSignature: ''
   };
+
+  function isNearConversationBottom() {
+    if (!conversationScroll) {
+      return true;
+    }
+    return conversationScroll.scrollTop + conversationScroll.clientHeight >= conversationScroll.scrollHeight - 72;
+  }
+
+  function scrollConversationToBottom() {
+    if (conversationScroll) {
+      conversationScroll.scrollTop = conversationScroll.scrollHeight;
+    }
+    const pageHeight = Math.max(
+      document.body ? document.body.scrollHeight : 0,
+      document.documentElement ? document.documentElement.scrollHeight : 0
+    );
+    window.scrollTo(0, pageHeight);
+  }
+
+  function requestConversationAutoScroll() {
+    scrollConversationToBottom();
+    requestAnimationFrame(function () {
+      scrollConversationToBottom();
+      requestAnimationFrame(scrollConversationToBottom);
+    });
+    window.setTimeout(scrollConversationToBottom, 80);
+  }
 
   function switchPage(page) {
     const isTask = page === 'task';
@@ -69,11 +101,15 @@
   }
 
   function updateTestInputPlaceholder() {
-    if (testModeSelect.value === 'generate') {
-      testInput.placeholder = 'Describe the examples, edge cases, and failure cases you want the model to turn into runnable tests.';
-      return;
-    }
     testInput.placeholder = 'Paste runnable Python tests here. They will run against the generated code directly.';
+  }
+
+  function selectedTestText() {
+    return testModeSelect.value === 'generate' ? '' : testInput.value;
+  }
+
+  function selectedResolvedTestCode() {
+    return testModeSelect.value === 'generate' ? resolvedTestsEditor.value : undefined;
   }
 
   function makeTimestamp() {
@@ -526,11 +562,28 @@
     return root;
   }
 
+  function renderResolvedTestsPreview() {
+    if (!resolvedTestsPreview) {
+      return;
+    }
+    resolvedTestsPreview.innerHTML = '';
+    const code = resolvedTestsEditor.value.trim();
+    if (!code) {
+      const empty = document.createElement('div');
+      empty.className = 'hint';
+      empty.textContent = 'Generated tests will be previewed here as a Python markdown code block.';
+      resolvedTestsPreview.appendChild(empty);
+      return;
+    }
+    resolvedTestsPreview.appendChild(renderFencedCodeMarkdown(code, 'python'));
+  }
+
   function currentActionPayload() {
     return {
       problem: problemInput.value,
-      testText: testInput.value,
+      testText: selectedTestText(),
       testMode: testModeSelect.value === 'generate' ? 'generate' : 'manual',
+      resolvedTestCode: selectedResolvedTestCode(),
       contextEnabled: Boolean(contextEnabledInput.checked),
       maxRounds: 10,
       executionMode: executionModeSelect.value === 'continue' ? 'continue' : 'auto'
@@ -611,7 +664,7 @@
       label.className = 'mini-heading';
       label.textContent = 'Tests';
       details.appendChild(label);
-      details.appendChild(renderMarkdown(state.session.test_text));
+      details.appendChild(renderFencedCodeMarkdown(state.session.test_text, 'python'));
       card.appendChild(details);
     }
 
@@ -878,14 +931,25 @@
 
   function renderTimeline() {
     syncEditablePlanDraft();
-    timeline.innerHTML = '';
     const entries = conversationEntries();
+    const timelineSignature = entries.map((entry) => entry.id).join('|');
+    const hasTimelineChange = timelineSignature !== state.lastTimelineSignature;
+    const shouldStickToBottom = state.running
+      || state.autoScrollPinned
+      || isNearConversationBottom()
+      || hasTimelineChange;
+
+    timeline.innerHTML = '';
+    state.lastTimelineSignature = timelineSignature;
 
     if (entries.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'empty-state';
       empty.textContent = 'No conversation yet. Send a prompt to begin.';
       timeline.appendChild(empty);
+      if (shouldStickToBottom) {
+        requestConversationAutoScroll();
+      }
       return;
     }
 
@@ -920,6 +984,10 @@
 
       timeline.appendChild(renderNoteCard(entry.event));
     });
+
+    if (shouldStickToBottom) {
+      requestConversationAutoScroll();
+    }
   }
 
   function renderProfileOptions() {
@@ -997,11 +1065,15 @@
     }
 
     state.lastSessionId = activeSessionId;
+    renderResolvedTestsPreview();
   }
 
   function syncLayout() {
     const showGeneratedTests = testModeSelect.value === 'generate'
       || Boolean(state.session && state.session.test_mode === 'generate');
+    if (manualTestsSection) {
+      manualTestsSection.classList.toggle('hidden', showGeneratedTests);
+    }
     testsWorkspaceSection.classList.toggle('hidden', !showGeneratedTests);
   }
 
@@ -1042,7 +1114,7 @@
   function renderResolvedTestsHint() {
     if (!state.session) {
       resolvedTestsHint.textContent = testModeSelect.value === 'generate'
-        ? 'Generate tests directly from the current draft. A session will be created automatically if needed.'
+        ? 'Generate assert tests directly from the current requirement. No extra test description is used.'
         : 'Switch to generated tests mode to keep a separate editable test suite outside workflow history and model context.';
       syncResolvedTestsEditor(false);
       return;
@@ -1050,8 +1122,8 @@
 
     resolvedTestsHint.textContent = state.session.test_mode === 'generate'
       ? (state.resolvedTestsDirty
-        ? 'Generated tests have unsaved edits. Save them before evaluation if you want the edited version to be used.'
-        : 'Generated tests stay separate from workflow history and model context.')
+        ? 'Generated tests have local edits. Use them before evaluation if you want the edited version to be selected immediately.'
+        : 'Generated tests stay separate from workflow history and model context. The selected test code is used by evaluation.')
       : 'Manual test mode uses the Tests box above directly.';
     syncResolvedTestsEditor(false);
   }
@@ -1076,11 +1148,13 @@
     state.resolvedTestsDirty = false;
     state.editablePlanEventId = '';
     state.editablePlanText = '';
+    state.lastTimelineSignature = '';
     state.session = null;
     state.lastSessionId = '';
     problemInput.value = '';
     testInput.value = '';
     resolvedTestsEditor.value = '';
+    renderResolvedTestsPreview();
     renderAll();
     problemInput.focus();
   }
@@ -1098,8 +1172,9 @@
   function currentRequestPayload() {
     return {
       problem: problemInput.value,
-      testText: testInput.value,
+      testText: selectedTestText(),
       testMode: testModeSelect.value === 'generate' ? 'generate' : 'manual',
+      resolvedTestCode: selectedResolvedTestCode(),
       contextEnabled: Boolean(contextEnabledInput.checked),
       maxRounds: 10,
       executionMode: executionModeSelect.value === 'continue' ? 'continue' : 'auto'
@@ -1143,6 +1218,7 @@
 
   resolvedTestsEditor.addEventListener('input', function () {
     state.resolvedTestsDirty = true;
+    renderResolvedTestsPreview();
     renderResolvedTestsHint();
     syncActionButtons();
   });
@@ -1242,6 +1318,12 @@
     }
   });
 
+  if (conversationScroll) {
+    conversationScroll.addEventListener('scroll', function () {
+      state.autoScrollPinned = isNearConversationBottom();
+    });
+  }
+
   window.addEventListener('message', function (event) {
     const data = event.data;
     if (!data || typeof data.type !== 'string') {
@@ -1290,6 +1372,7 @@
         }
         if (!state.session) {
           state.lastSessionId = '';
+          state.lastTimelineSignature = '';
         }
         renderAll();
         break;

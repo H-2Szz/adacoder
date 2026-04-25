@@ -122,12 +122,6 @@ class AdacoderExecutor():
             raise RuntimeError("输入不能是空")
 
         context_block = self._build_context_block(context_entries)
-        cleaned_description = test_description.strip()
-        if not cleaned_description:
-            cleaned_description = (
-                "Create a compact Python test suite that validates the expected behavior, "
-                "important edge cases, and obvious failure paths when applicable."
-            )
         target_symbols = self._extract_target_symbols(problem_statement)
         target_block = ""
         if target_symbols:
@@ -145,9 +139,6 @@ You must call them in the tests and must NOT redefine them.
 {problem_statement}
 {target_block}
 
-## Test Guidance
-{cleaned_description}
-
 ## Output Rules
 - Output ONLY Python test code.
 - Do not wrap the answer in markdown fences.
@@ -158,6 +149,7 @@ You must call them in the tests and must NOT redefine them.
 - Do NOT use `unittest`, `pytest`, or custom test frameworks.
 - If helper functions are needed, keep them small and still end with direct top-level `assert` checks.
 - Every valid answer must contain at least one `assert`.
+- Infer representative normal, boundary, and edge cases directly from the task description.
 - The test code should fail loudly when the implementation is wrong.
 """
 
