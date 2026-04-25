@@ -161,30 +161,70 @@ textarea {
 .setup-shell {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 0;
   flex: 0 0 auto;
+  overflow: hidden;
 }
 
-.setup-grid {
-  display: grid;
-  grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.2fr);
-  gap: 16px;
-  padding: 0 16px 16px;
+.setup-details + .setup-details {
+  border-top: 1px solid var(--border);
 }
 
-.setup-block {
+.setup-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  cursor: pointer;
+  color: var(--fg);
+  list-style: none;
+}
+
+.setup-summary::-webkit-details-marker {
+  display: none;
+}
+
+.setup-summary::before {
+  content: ">";
+  color: var(--muted);
+  font-family: var(--vscode-editor-font-family, monospace);
+  margin-right: 2px;
+  transform: rotate(0deg);
+  transition: transform 120ms ease;
+}
+
+.setup-details[open] .setup-summary::before {
+  transform: rotate(90deg);
+}
+
+.setup-summary span:first-child {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.setup-summary-note {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.setup-detail-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  padding: 0 14px 14px 30px;
   min-width: 0;
 }
 
-.setup-block + .setup-block {
-  padding-left: 16px;
-  border-left: 1px solid var(--border);
-}
-
-.setup-block-header,
 .generated-tests-header {
   display: flex;
   flex-direction: column;
@@ -198,16 +238,6 @@ textarea {
   margin-top: 4px;
   padding-top: 12px;
   border-top: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
-}
-
-.generated-tests-preview {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.generated-tests-preview .code-shell {
-  margin: 0;
 }
 
 .manual-tests-shell {
@@ -492,36 +522,16 @@ textarea {
 
 .code-block code {
   display: block;
-  color: var(--fg);
+  color: inherit;
   font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
   font-size: 12px;
   line-height: 1.6;
   white-space: pre;
 }
 
-.tok-comment {
-  color: color-mix(in srgb, var(--muted) 92%, transparent);
-}
-
-.tok-string {
-  color: #c78a47;
-}
-
-.tok-number {
-  color: #b56ad9;
-}
-
-.tok-keyword {
-  color: #4f7cd1;
-  font-weight: 600;
-}
-
-.tok-builtin {
-  color: #007f7a;
-}
-
-.tok-decorator {
-  color: #7f5fbf;
+.code-block.hljs {
+  color: inherit;
+  background: transparent;
 }
 
 .conversation-shell {
@@ -599,6 +609,18 @@ textarea {
 
 .conversation-card.plan {
   background: color-mix(in srgb, var(--surface) 95%, #f2eefb 5%);
+}
+
+.plan-preview {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--input-bg);
+  cursor: text;
+}
+
+.plan-preview:hover {
+  border-color: var(--border-strong);
 }
 
 .conversation-card.result {
@@ -727,6 +749,35 @@ textarea {
   border-top: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
 }
 
+.result-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.result-line {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface-strong) 72%, transparent);
+}
+
+.result-line.passed {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 36%, var(--border));
+  background: color-mix(in srgb, var(--ok) 8%, transparent);
+}
+
+.result-line.failed {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 40%, var(--border));
+  background: color-mix(in srgb, var(--error) 8%, transparent);
+}
+
+.result-line.muted-line {
+  color: var(--muted);
+}
+
 .mini-heading {
   font-size: 11px;
   letter-spacing: 0.06em;
@@ -736,6 +787,46 @@ textarea {
 
 .inline-editor {
   min-height: 168px;
+}
+
+.editable-code-shell {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--input-bg) 94%, transparent);
+}
+
+.editable-code-block {
+  margin: 0;
+  min-height: 108px;
+  padding: 0;
+}
+
+.editable-code {
+  display: block;
+  min-height: 108px;
+  padding: 12px;
+  outline: none;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.editable-code:empty::before {
+  content: attr(data-placeholder);
+  color: var(--muted);
+}
+
+.markdown-editable {
+  min-height: 132px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--input-bg) 94%, transparent);
+}
+
+.markdown-editable:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 62%, var(--border));
 }
 
 .markdown {
@@ -858,17 +949,6 @@ textarea {
 
   .form-grid {
     grid-template-columns: 1fr;
-  }
-
-  .setup-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .setup-block + .setup-block {
-    padding-left: 0;
-    padding-top: 12px;
-    border-left: 0;
-    border-top: 1px solid var(--border);
   }
 
   .composer-row select {

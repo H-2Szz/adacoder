@@ -387,11 +387,14 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 	}
 
 	public async resolveWebviewView(webviewView: vscode.WebviewView): Promise<void> {
-		this.view = webviewView;
-		webviewView.webview.options = {
-			enableScripts: true,
-			localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]
-		};
+			this.view = webviewView;
+			webviewView.webview.options = {
+				enableScripts: true,
+				localResourceRoots: [
+					vscode.Uri.joinPath(this.context.extensionUri, 'media'),
+					vscode.Uri.joinPath(this.context.extensionUri, 'node_modules')
+				]
+			};
 		webviewView.webview.html = getChatHtml(webviewView.webview, this.context.extensionUri);
 
 		this.clearViewDisposables();
@@ -549,18 +552,18 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 					break;
 				}
 					case 'switchProfile': {
-					const profileId = typeof message.profileId === 'string' ? message.profileId : '';
-					if (!profileId) {
+						const profileId = typeof message.profileId === 'string' ? message.profileId : '';
+						if (!profileId) {
+							break;
+						}
+						const exists = this.profiles.some((profile) => profile.id === profileId);
+						if (!exists) {
+							break;
+						}
+						this.activeProfileId = profileId;
+						await this.persistProfiles(context);
+						await this.postState();
 						break;
-					}
-					const exists = this.profiles.some((profile) => profile.id === profileId);
-					if (!exists) {
-						break;
-					}
-					this.activeProfileId = profileId;
-					await this.persistProfiles(context);
-					await this.postState();
-					break;
 					}
 					case 'saveProfile': {
 						await this.saveProfile(context, message);
@@ -1058,6 +1061,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			contextEnabled?: boolean;
 			maxRounds?: number;
 			planOverride?: string;
+			executionMode?: 'auto' | 'continue';
 			resolvedTestCode?: string;
 		}
 	): Promise<BackendResponse> {
@@ -1173,11 +1177,12 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			testText?: string;
 			testMode?: TestMode;
 			useErrorFeedback: boolean;
-			contextEnabled?: boolean;
-			maxRounds?: number;
-			planOverride?: string;
-			resolvedTestCode?: string;
-		}
+				contextEnabled?: boolean;
+				maxRounds?: number;
+				planOverride?: string;
+				executionMode?: 'auto' | 'continue';
+				resolvedTestCode?: string;
+			}
 	): Promise<void> {
 		if (!this.activeSession?.session_id) {
 			this.appendUiLog('error', 'No active workflow session. Start a session first.');
@@ -1231,11 +1236,12 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			testText?: string;
 			testMode?: TestMode;
 			useErrorFeedback: boolean;
-			contextEnabled?: boolean;
-			maxRounds?: number;
-			planOverride?: string;
-			resolvedTestCode?: string;
-		}
+				contextEnabled?: boolean;
+				maxRounds?: number;
+				planOverride?: string;
+				executionMode?: 'auto' | 'continue';
+				resolvedTestCode?: string;
+			}
 	): Promise<void> {
 		if (!this.activeSession?.session_id) {
 			this.appendUiLog('error', 'No active workflow session. Start a session first.');
@@ -1273,6 +1279,7 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			contextEnabled?: boolean;
 			maxRounds?: number;
 			planOverride?: string;
+			executionMode?: 'auto' | 'continue';
 			resolvedTestCode?: string;
 		}
 	): Promise<void> {
@@ -1281,12 +1288,47 @@ class AdacoderChatPanel implements vscode.WebviewViewProvider {
 			return;
 		}
 
-		await this.runGuarded('Restarting from the original requirement...', 'Restart failed', async () => {
-			this.workflowMode = 'continue';
-			this.clearResumeState();
-			this.setRunState(true, 'Generating a fresh attempt from the requirement...');
-			await this.invokeWorkflowAction({
-				action: 'restart',
+			await this.runGuarded('Restarting from the original requirement...', 'Restart failed', async () => {
+				const selectedMode = request.executionMode === 'auto' ? 'auto' : 'continue';
+				this.workflowMode = selectedMode;
+				this.clearResumeState();
+
+				if (selectedMode === 'auto') {
+					this.setRunState(true, 'Restarting the full auto workflow from the requirement...');
+					const payload = await this.invokeWorkflowAction({
+						action: 'auto',
+						problem: request.problem,
+						testText: request.testText,
+						testMode: request.testMode,
+						useErrorFeedback: false,
+						contextEnabled: request.contextEnabled,
+						maxRounds: request.maxRounds,
+						resolvedTestCode: request.resolvedTestCode
+					});
+					if (payload.stage_result?.interrupted) {
+						this.resumeState = {
+							kind: 'auto',
+							request: {
+								problem: request.problem ?? this.activeSession?.problem_statement ?? '',
+								testText: request.testText ?? this.activeSession?.test_text ?? '',
+								testMode: request.testMode ?? this.activeSession?.test_mode ?? 'manual',
+								contextEnabled: request.contextEnabled ?? this.activeSession?.context_enabled ?? false,
+								maxRounds: request.maxRounds ?? this.activeSession?.max_rounds ?? 10,
+								executionMode: 'auto',
+								resolvedTestCode: request.resolvedTestCode
+							}
+						};
+						this.interruptRequested = false;
+						await this.postState();
+					}
+					this.interactiveState = this.activeSession?.passed ? 'done' : 'idle';
+					this.postSessionState();
+					return;
+				}
+
+				this.setRunState(true, 'Generating a fresh attempt from the requirement...');
+				await this.invokeWorkflowAction({
+					action: 'restart',
 				problem: request.problem,
 				testText: request.testText,
 				testMode: request.testMode,
@@ -1917,26 +1959,32 @@ async function insertGeneratedCode(code: string): Promise<void> {
 	}
 }
 
-function getChatHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
-	const nonce = randomBytes(16).toString('base64');
+	function getChatHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
+		const nonce = randomBytes(16).toString('base64');
 	const csp = [
 		"default-src 'none'",
 		`img-src ${webview.cspSource} data:`,
 		`style-src ${webview.cspSource} 'unsafe-inline'`,
 		`script-src ${webview.cspSource} 'nonce-${nonce}'`
-	].join('; ');
-	const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'webview.css'));
-	const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'webview.js'));
+		].join('; ');
+		const highlightStyleUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'node_modules', '@highlightjs', 'cdn-assets', 'styles', 'github-dark.min.css'));
+		const markdownItUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'node_modules', 'markdown-it', 'dist', 'markdown-it.min.js'));
+		const highlightScriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'node_modules', '@highlightjs', 'cdn-assets', 'highlight.min.js'));
+		const highlightPythonUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'node_modules', '@highlightjs', 'cdn-assets', 'languages', 'python.min.js'));
+		const highlightMarkdownUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'node_modules', '@highlightjs', 'cdn-assets', 'languages', 'markdown.min.js'));
+		const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'webview.css'));
+		const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'webview.js'));
 
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
 	<meta charset="UTF-8" />
-	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-	<meta http-equiv="Content-Security-Policy" content="${csp}" />
-	<link rel="stylesheet" href="${styleUri}" />
-	<title>${EXTENSION_DISPLAY_NAME}</title>
-</head>
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<meta http-equiv="Content-Security-Policy" content="${csp}" />
+		<link rel="stylesheet" href="${highlightStyleUri}" />
+		<link rel="stylesheet" href="${styleUri}" />
+		<title>${EXTENSION_DISPLAY_NAME}</title>
+	</head>
 <body>
 	<div class="app-shell">
 		<header class="app-header">
@@ -1950,67 +1998,64 @@ function getChatHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string 
 			</div>
 		</header>
 
-		<main class="page active" id="taskPage">
-			<section class="setup-shell">
-				<div class="section-header">
-					<div>
-						<div class="panel-title">Setup</div>
-						<div class="panel-copy">Keep model settings and test setup here before you send the next task.</div>
-					</div>
-				</div>
-				<div class="setup-grid">
-					<section class="setup-block">
-						<div class="setup-block-header">
-							<div class="mini-heading">Model</div>
-							<div class="hint">Profile and context behavior for the next run.</div>
+			<main class="page active" id="taskPage">
+				<section class="setup-shell">
+					<details class="setup-details">
+						<summary class="setup-summary">
+							<span>Model</span>
+							<span class="setup-summary-note" id="modelSummary">Profile and context</span>
+						</summary>
+						<div class="setup-detail-body">
+							<div class="field compact-field">
+								<label for="taskProfileSelect">LLM Profile</label>
+								<select id="taskProfileSelect"></select>
+							</div>
+							<label class="checkbox-chip" for="contextEnabledInput">
+								<input id="contextEnabledInput" type="checkbox" />
+								<span>Use Context</span>
+							</label>
 						</div>
-						<div class="field compact-field">
-							<label for="taskProfileSelect">LLM Profile</label>
-							<select id="taskProfileSelect"></select>
-						</div>
-						<label class="checkbox-chip" for="contextEnabledInput">
-							<input id="contextEnabledInput" type="checkbox" />
-							<span>Use Context</span>
-						</label>
-					</section>
+					</details>
 
-					<section class="setup-block">
-						<div class="setup-block-header">
-							<div class="panel-header">
-								<div>
-									<div class="mini-heading">Tests</div>
-									<div class="hint">Manual tests run directly. Generated tests stay isolated from workflow context.</div>
+					<details class="setup-details" id="testSettingsDetails">
+						<summary class="setup-summary">
+							<span>Tests</span>
+							<span class="setup-summary-note" id="testsSummary">Manual tests</span>
+						</summary>
+						<div class="setup-detail-body">
+							<div class="field compact-field narrow-field">
+								<label for="testModeSelect">Test Mode</label>
+								<select id="testModeSelect">
+									<option value="manual">Manual Tests</option>
+									<option value="generate">Generate Tests</option>
+								</select>
+							</div>
+							<div class="manual-tests-shell" id="manualTestsSection">
+								<div class="editable-code-shell">
+									<div class="code-toolbar"><div class="code-language">python</div></div>
+									<pre class="code-block hljs editable-code-block"><code id="testInput" class="language-python editable-code" contenteditable="true" spellcheck="false"></code></pre>
 								</div>
-								<div class="field compact-field narrow-field">
-									<label for="testModeSelect">Test Mode</label>
-									<select id="testModeSelect">
-										<option value="manual">Manual Tests</option>
-										<option value="generate">Generate Tests</option>
-									</select>
+								<div class="action-row">
+									<button class="btn secondary" id="useSelectionForTestsBtn" type="button">Selection To Tests</button>
+								</div>
+							</div>
+							<div class="generated-tests-shell hidden" id="testsWorkspaceSection">
+								<div class="generated-tests-header">
+									<div class="mini-heading">Generated Test Suite</div>
+									<div class="hint" id="resolvedTestsHint">Switch to generated tests mode to work with a separate editable test suite.</div>
+								</div>
+								<div class="editable-code-shell">
+									<div class="code-toolbar"><div class="code-language">python</div></div>
+									<pre class="code-block hljs editable-code-block"><code id="resolvedTestsEditor" class="language-python editable-code" contenteditable="true" spellcheck="false"></code></pre>
+								</div>
+								<div class="action-row">
+									<button class="btn secondary" id="generateTestsBtn" type="button">Generate Tests</button>
+									<button class="btn secondary" id="saveResolvedTestsBtn" type="button">Use Edited Tests</button>
 								</div>
 							</div>
 						</div>
-						<div class="manual-tests-shell" id="manualTestsSection">
-							<textarea id="testInput" placeholder="Paste runnable Python tests here. They will run against the generated code directly."></textarea>
-							<div class="action-row">
-								<button class="btn secondary" id="useSelectionForTestsBtn" type="button">Selection To Tests</button>
-							</div>
-						</div>
-						<div class="generated-tests-shell hidden" id="testsWorkspaceSection">
-							<div class="generated-tests-header">
-								<div class="mini-heading">Generated Test Suite</div>
-								<div class="hint" id="resolvedTestsHint">Switch to generated tests mode to work with a separate editable test suite.</div>
-							</div>
-							<textarea id="resolvedTestsEditor" placeholder="Generated runnable assert tests will appear here. You can edit them before applying."></textarea>
-							<div class="generated-tests-preview" id="resolvedTestsPreview"></div>
-							<div class="action-row">
-								<button class="btn secondary" id="generateTestsBtn" type="button">Generate Tests</button>
-								<button class="btn secondary" id="saveResolvedTestsBtn" type="button">Use Edited Tests</button>
-							</div>
-						</div>
-					</section>
-				</div>
-			</section>
+					</details>
+				</section>
 
 			<section class="conversation-shell">
 				<div class="section-header conversation-header">
@@ -2099,7 +2144,11 @@ function getChatHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string 
 		</main>
 	</div>
 
-	<script nonce="${nonce}" src="${scriptUri}"></script>
-</body>
-</html>`;
+		<script nonce="${nonce}" src="${markdownItUri}"></script>
+		<script nonce="${nonce}" src="${highlightScriptUri}"></script>
+		<script nonce="${nonce}" src="${highlightPythonUri}"></script>
+		<script nonce="${nonce}" src="${highlightMarkdownUri}"></script>
+		<script nonce="${nonce}" src="${scriptUri}"></script>
+	</body>
+	</html>`;
 }

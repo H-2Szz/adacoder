@@ -12,6 +12,8 @@
   const problemInput = document.getElementById('problemInput');
   const testInput = document.getElementById('testInput');
   const testModeSelect = document.getElementById('testModeSelect');
+  const modelSummary = document.getElementById('modelSummary');
+  const testsSummary = document.getElementById('testsSummary');
   const executionModeSelect = document.getElementById('executionModeSelect');
   const contextEnabledInput = document.getElementById('contextEnabledInput');
   const composerStatus = document.getElementById('composerStatus');
@@ -24,7 +26,6 @@
   const testsWorkspaceSection = document.getElementById('testsWorkspaceSection');
   const resolvedTestsHint = document.getElementById('resolvedTestsHint');
   const resolvedTestsEditor = document.getElementById('resolvedTestsEditor');
-  const resolvedTestsPreview = document.getElementById('resolvedTestsPreview');
   const generateTestsBtn = document.getElementById('generateTestsBtn');
   const saveResolvedTestsBtn = document.getElementById('saveResolvedTestsBtn');
 
@@ -63,6 +64,7 @@
     interruptRequested: false,
     editablePlanEventId: '',
     editablePlanText: '',
+    editingPlanSource: false,
     autoScrollPinned: true,
     lastTimelineSignature: ''
   };
@@ -101,15 +103,47 @@
   }
 
   function updateTestInputPlaceholder() {
-    testInput.placeholder = 'Paste runnable Python tests here. They will run against the generated code directly.';
+    if (testInput) {
+      testInput.dataset.placeholder = 'Paste runnable Python assert tests here.';
+    }
+    if (resolvedTestsEditor) {
+      resolvedTestsEditor.dataset.placeholder = 'Generated assert tests appear here. Edit directly in this Python block.';
+    }
+  }
+
+  function editableCodeText(element) {
+    return element ? String(element.textContent || '') : '';
+  }
+
+  function highlightEditableCode(element) {
+    if (!element || document.activeElement === element || !window.hljs) {
+      return;
+    }
+    element.removeAttribute('data-highlighted');
+    window.hljs.highlightElement(element);
+  }
+
+  function setEditableCodeText(element, code) {
+    if (!element) {
+      return;
+    }
+    element.textContent = String(code || '');
+    highlightEditableCode(element);
+  }
+
+  function prepareEditableCodeForInput(element) {
+    if (!element) {
+      return;
+    }
+    element.textContent = editableCodeText(element);
   }
 
   function selectedTestText() {
-    return testModeSelect.value === 'generate' ? '' : testInput.value;
+    return testModeSelect.value === 'generate' ? '' : editableCodeText(testInput);
   }
 
   function selectedResolvedTestCode() {
-    return testModeSelect.value === 'generate' ? resolvedTestsEditor.value : undefined;
+    return testModeSelect.value === 'generate' ? editableCodeText(resolvedTestsEditor) : undefined;
   }
 
   function makeTimestamp() {
@@ -142,30 +176,6 @@
       .replaceAll("'", '&#39;');
   }
 
-  function renderInlineMarkdown(text) {
-    let safe = escapeHtml(String(text || ''));
-    safe = safe.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-    safe = safe.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    safe = safe.replace(/__([^_]+)__/g, '<strong>$1</strong>');
-    safe = safe.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-    safe = safe.replace(/_([^_]+)_/g, '<em>$1</em>');
-    safe = safe.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2">$1</a>');
-    return safe;
-  }
-
-  const PYTHON_KEYWORDS = new Set([
-    'and', 'as', 'assert', 'async', 'await', 'break', 'case', 'class', 'continue',
-    'def', 'del', 'elif', 'else', 'except', 'False', 'finally', 'for', 'from',
-    'global', 'if', 'import', 'in', 'is', 'lambda', 'match', 'None', 'nonlocal',
-    'not', 'or', 'pass', 'raise', 'return', 'True', 'try', 'while', 'with', 'yield'
-  ]);
-
-  const PYTHON_BUILTINS = new Set([
-    'abs', 'all', 'any', 'bool', 'dict', 'enumerate', 'filter', 'float', 'int',
-    'len', 'list', 'map', 'max', 'min', 'print', 'range', 'reversed', 'set',
-    'sorted', 'str', 'sum', 'tuple', 'type', 'zip'
-  ]);
-
   function normalizeLanguage(language) {
     const normalized = String(language || '').trim().toLowerCase();
     if (!normalized) {
@@ -180,282 +190,100 @@
     return normalized;
   }
 
-  function highlightPython(code) {
-    const text = String(code || '');
-    let index = 0;
-    let highlighted = '';
-
-    function appendToken(tokenClass, value) {
-      highlighted += '<span class="' + tokenClass + '">' + escapeHtml(value) + '</span>';
-    }
-
-    while (index < text.length) {
-      const char = text[index];
-      const nextThree = text.slice(index, index + 3);
-
-      if (char === '#') {
-        let end = index + 1;
-        while (end < text.length && text[end] !== '\n') {
-          end += 1;
-        }
-        appendToken('tok-comment', text.slice(index, end));
-        index = end;
-        continue;
-      }
-
-      if (nextThree === '"""' || nextThree === "'''") {
-        const delimiter = nextThree;
-        let end = index + 3;
-        while (end < text.length && text.slice(end, end + 3) !== delimiter) {
-          end += 1;
-        }
-        end = Math.min(text.length, end + 3);
-        appendToken('tok-string', text.slice(index, end));
-        index = end;
-        continue;
-      }
-
-      if (char === '"' || char === "'") {
-        const delimiter = char;
-        let end = index + 1;
-        while (end < text.length) {
-          if (text[end] === '\\') {
-            end += 2;
-            continue;
-          }
-          if (text[end] === delimiter) {
-            end += 1;
-            break;
-          }
-          end += 1;
-        }
-        appendToken('tok-string', text.slice(index, end));
-        index = end;
-        continue;
-      }
-
-      if (char === '@') {
-        let end = index + 1;
-        while (end < text.length && text[end] !== '\n') {
-          end += 1;
-        }
-        appendToken('tok-decorator', text.slice(index, end));
-        index = end;
-        continue;
-      }
-
-      if (/[0-9]/.test(char)) {
-        let end = index + 1;
-        while (end < text.length && /[0-9A-Fa-f_xob.]/.test(text[end])) {
-          end += 1;
-        }
-        appendToken('tok-number', text.slice(index, end));
-        index = end;
-        continue;
-      }
-
-      if (/[A-Za-z_]/.test(char)) {
-        let end = index + 1;
-        while (end < text.length && /[A-Za-z0-9_]/.test(text[end])) {
-          end += 1;
-        }
-        const word = text.slice(index, end);
-        if (PYTHON_KEYWORDS.has(word)) {
-          appendToken('tok-keyword', word);
-        } else if (PYTHON_BUILTINS.has(word)) {
-          appendToken('tok-builtin', word);
-        } else {
-          highlighted += escapeHtml(word);
-        }
-        index = end;
-        continue;
-      }
-
-      highlighted += escapeHtml(char);
-      index += 1;
-    }
-
-    return highlighted;
-  }
-
-  function highlightCode(code, language) {
-    const normalized = normalizeLanguage(language);
-    if (normalized === 'python') {
-      return highlightPython(code);
-    }
-    return escapeHtml(String(code || ''));
-  }
-
-  function createCodeBlock(code, language, options) {
+  function highlightWithLibrary(code, language) {
     const normalizedLanguage = normalizeLanguage(language);
-    const shell = document.createElement('div');
-    shell.className = 'code-shell';
-
-    const toolbar = document.createElement('div');
-    toolbar.className = 'code-toolbar';
-
-    const languageLabel = document.createElement('div');
-    languageLabel.className = 'code-language';
-    languageLabel.textContent = normalizedLanguage;
-    toolbar.appendChild(languageLabel);
-
-    const actions = options && Array.isArray(options.actions) ? options.actions : [];
-    if (actions.length > 0) {
-      const actionsWrap = document.createElement('div');
-      actionsWrap.className = 'code-toolbar-actions';
-      actions.forEach(function (action) {
-        actionsWrap.appendChild(createButton(
-          action.label,
-          action.className || 'secondary code-action',
-          action.onClick,
-          action.disabled
-        ));
-      });
-      toolbar.appendChild(actionsWrap);
+    if (window.hljs && normalizedLanguage !== 'text') {
+      try {
+        if (window.hljs.getLanguage(normalizedLanguage)) {
+          return window.hljs.highlight(String(code || ''), { language: normalizedLanguage }).value;
+        }
+        return window.hljs.highlightAuto(String(code || '')).value;
+      } catch (_error) {
+        return escapeHtml(code);
+      }
     }
-
-    const pre = document.createElement('pre');
-    pre.className = 'code-block';
-
-    const codeEl = document.createElement('code');
-    codeEl.className = normalizedLanguage ? 'language-' + normalizedLanguage : '';
-    codeEl.innerHTML = highlightCode(code, normalizedLanguage);
-
-    pre.appendChild(codeEl);
-    shell.appendChild(toolbar);
-    shell.appendChild(pre);
-    return shell;
+    return escapeHtml(code);
   }
+
+  function markdownRenderer() {
+    if (!window.markdownit) {
+      return null;
+    }
+    const md = window.markdownit({
+      breaks: false,
+      html: false,
+      linkify: true
+    });
+    md.renderer.rules.fence = function (tokens, index) {
+      const token = tokens[index];
+      const language = normalizeLanguage(token.info || 'text');
+      const highlighted = highlightWithLibrary(token.content, language);
+      return [
+        '<div class="code-shell">',
+        '<div class="code-toolbar"><div class="code-language">',
+        escapeHtml(language),
+        '</div></div>',
+        '<pre class="code-block hljs"><code class="language-',
+        escapeHtml(language),
+        '">',
+        highlighted,
+        '</code></pre>',
+        '</div>'
+      ].join('');
+    };
+    return md;
+  }
+
+  const md = markdownRenderer();
 
   function renderMarkdown(text) {
     const root = document.createElement('div');
     root.className = 'markdown';
-    const lines = String(text || '').replaceAll('\r\n', '\n').split('\n');
-    let paragraph = [];
-
-    function flushParagraph() {
-      if (paragraph.length === 0) {
-        return;
-      }
-      const p = document.createElement('p');
-      p.innerHTML = renderInlineMarkdown(paragraph.join(' '));
-      root.appendChild(p);
-      paragraph = [];
+    if (!md) {
+      root.textContent = String(text || '');
+      return root;
     }
-
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index];
-      const trimmed = line.trim();
-
-      if (trimmed.startsWith('```')) {
-        flushParagraph();
-        const language = trimmed.slice(3).trim();
-        const block = [];
-        index += 1;
-        while (index < lines.length && !lines[index].trim().startsWith('```')) {
-          block.push(lines[index]);
-          index += 1;
-        }
-        root.appendChild(createCodeBlock(block.join('\n'), language));
-        continue;
-      }
-
-      if (!trimmed) {
-        flushParagraph();
-        continue;
-      }
-
-      if (trimmed.startsWith('#### ')) {
-        flushParagraph();
-        const heading = document.createElement('h4');
-        heading.innerHTML = renderInlineMarkdown(trimmed.slice(5));
-        root.appendChild(heading);
-        continue;
-      }
-
-      if (trimmed.startsWith('### ')) {
-        flushParagraph();
-        const heading = document.createElement('h3');
-        heading.innerHTML = renderInlineMarkdown(trimmed.slice(4));
-        root.appendChild(heading);
-        continue;
-      }
-
-      if (trimmed.startsWith('## ')) {
-        flushParagraph();
-        const heading = document.createElement('h2');
-        heading.innerHTML = renderInlineMarkdown(trimmed.slice(3));
-        root.appendChild(heading);
-        continue;
-      }
-
-      if (trimmed.startsWith('# ')) {
-        flushParagraph();
-        const heading = document.createElement('h1');
-        heading.innerHTML = renderInlineMarkdown(trimmed.slice(2));
-        root.appendChild(heading);
-        continue;
-      }
-
-      if (trimmed.startsWith('>')) {
-        flushParagraph();
-        const quote = document.createElement('blockquote');
-        quote.innerHTML = renderInlineMarkdown(trimmed.replace(/^>\s?/, ''));
-        root.appendChild(quote);
-        continue;
-      }
-
-      const orderedMatch = trimmed.match(/^(\d+)\.\s+(.*)$/);
-      if (orderedMatch) {
-        flushParagraph();
-        const list = document.createElement('ol');
-        list.start = Number(orderedMatch[1]);
-        while (index < lines.length) {
-          const current = lines[index].trim();
-          const match = current.match(/^(\d+)\.\s+(.*)$/);
-          if (!match) {
-            break;
-          }
-          const item = document.createElement('li');
-          item.innerHTML = renderInlineMarkdown(match[2]);
-          list.appendChild(item);
-          index += 1;
-        }
-        index -= 1;
-        root.appendChild(list);
-        continue;
-      }
-
-      if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
-        flushParagraph();
-        const list = document.createElement('ul');
-        while (index < lines.length) {
-          const current = lines[index].trim();
-          if (!(current.startsWith('- ') || current.startsWith('* '))) {
-            break;
-          }
-          const item = document.createElement('li');
-          item.innerHTML = renderInlineMarkdown(current.slice(2));
-          list.appendChild(item);
-          index += 1;
-        }
-        index -= 1;
-        root.appendChild(list);
-        continue;
-      }
-
-      paragraph.push(trimmed);
-    }
-
-    flushParagraph();
-
-    if (root.childNodes.length === 0) {
-      const empty = document.createElement('p');
-      empty.textContent = '';
-      root.appendChild(empty);
-    }
-
+    root.innerHTML = md.render(String(text || ''));
+    root.querySelectorAll('a[href]').forEach(function (link) {
+      link.setAttribute('target', '_blank');
+      link.setAttribute('rel', 'noreferrer noopener');
+    });
     return root;
+  }
+
+  function renderEditableMarkdown(text, onInput) {
+    const shell = document.createElement('div');
+    shell.className = 'editable-code-shell markdown-source-shell';
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'code-toolbar';
+    const languageLabel = document.createElement('div');
+    languageLabel.className = 'code-language';
+    languageLabel.textContent = 'markdown';
+    toolbar.appendChild(languageLabel);
+
+    const pre = document.createElement('pre');
+    pre.className = 'code-block hljs editable-code-block';
+    const code = document.createElement('code');
+    code.className = 'language-markdown editable-code';
+    code.contentEditable = state.running ? 'false' : 'true';
+    code.spellcheck = false;
+    code.dataset.placeholder = 'Edit the markdown plan here.';
+    setEditableCodeText(code, text);
+    code.addEventListener('focus', function () {
+      prepareEditableCodeForInput(code);
+    });
+    code.addEventListener('blur', function () {
+      highlightEditableCode(code);
+    });
+    code.addEventListener('input', function () {
+      onInput(editableCodeText(code).trim());
+    });
+
+    pre.appendChild(code);
+    shell.appendChild(toolbar);
+    shell.appendChild(pre);
+    return shell;
   }
 
   function createBadge(text, className) {
@@ -562,20 +390,9 @@
     return root;
   }
 
-  function renderResolvedTestsPreview() {
-    if (!resolvedTestsPreview) {
-      return;
-    }
-    resolvedTestsPreview.innerHTML = '';
-    const code = resolvedTestsEditor.value.trim();
-    if (!code) {
-      const empty = document.createElement('div');
-      empty.className = 'hint';
-      empty.textContent = 'Generated tests will be previewed here as a Python markdown code block.';
-      resolvedTestsPreview.appendChild(empty);
-      return;
-    }
-    resolvedTestsPreview.appendChild(renderFencedCodeMarkdown(code, 'python'));
+  function refreshEditableCodeBlocks() {
+    highlightEditableCode(testInput);
+    highlightEditableCode(resolvedTestsEditor);
   }
 
   function currentActionPayload() {
@@ -634,12 +451,14 @@
     if (state.interactiveState !== 'await_plan') {
       state.editablePlanEventId = '';
       state.editablePlanText = '';
+      state.editingPlanSource = false;
       return;
     }
 
     if (latestPlanId !== state.editablePlanEventId) {
       state.editablePlanEventId = latestPlanId;
       state.editablePlanText = latestPlanText;
+      state.editingPlanSource = false;
     }
   }
 
@@ -705,25 +524,40 @@
   function renderResultCard(event, isLatestEvaluate, isLatestFailed) {
     const card = createCardFrame('result', event);
     const evaluation = event.data && typeof event.data.evaluation === 'object' ? event.data.evaluation : {};
-    const summary = [];
+    const summary = document.createElement('div');
+    summary.className = 'result-summary';
+
+    function appendResultLine(markdown, className) {
+      const line = renderMarkdown(markdown);
+      line.classList.add('result-line');
+      if (className) {
+        line.classList.add(className);
+      }
+      summary.appendChild(line);
+    }
+
+    const passed = evaluation && evaluation.passed === true;
+    const failed = event.status === 'failed' || (evaluation && evaluation.passed === false);
 
     if (event.message) {
-      summary.push(event.message);
+      appendResultLine(event.message, passed ? 'passed' : failed ? 'failed' : '');
     }
     if (evaluation && typeof evaluation.stage === 'string' && evaluation.stage) {
-      summary.push('Stage: ' + evaluation.stage);
+      appendResultLine('**Stage:** `' + evaluation.stage + '`', 'muted-line');
     }
     if (evaluation && typeof evaluation.error_type === 'string' && evaluation.error_type) {
-      summary.push('Error Type: ' + evaluation.error_type);
+      appendResultLine('**Error Type:** `' + evaluation.error_type + '`', 'failed');
     }
     if (evaluation && typeof evaluation.error === 'string' && evaluation.error) {
-      summary.push('Error: ' + evaluation.error);
+      appendResultLine('**Error:** ' + evaluation.error, 'failed');
     }
     if (evaluation && typeof evaluation.passed === 'boolean') {
-      summary.push('Passed: ' + (evaluation.passed ? 'yes' : 'no'));
+      appendResultLine('**Passed:** ' + (evaluation.passed ? 'yes' : 'no'), evaluation.passed ? 'passed' : 'failed');
     }
 
-    card.appendChild(renderMarkdown(summary.join('\n\n')));
+    if (summary.childNodes.length > 0) {
+      card.appendChild(summary);
+    }
 
     if (evaluation && typeof evaluation.traceback === 'string' && evaluation.traceback.trim()) {
       const trace = document.createElement('div');
@@ -786,18 +620,33 @@
     note.textContent = 'Interactive mode paused here. Edit this plan, regenerate it from the latest failure, or move to the next step from this card.';
     card.appendChild(note);
 
-    const editor = document.createElement('textarea');
-    editor.className = 'inline-editor';
-    editor.value = state.editablePlanText;
-    editor.placeholder = 'Edit the current repair plan here.';
-    editor.disabled = state.running;
-    editor.addEventListener('input', function () {
-      state.editablePlanText = editor.value;
-    });
-    card.appendChild(editor);
+    if (state.editingPlanSource) {
+      card.appendChild(renderEditableMarkdown(state.editablePlanText || plan, function (value) {
+        state.editablePlanText = value;
+      }));
+    } else {
+      const preview = document.createElement('div');
+      preview.className = 'plan-preview';
+      preview.title = 'Click to edit the markdown source.';
+      preview.appendChild(renderMarkdown(state.editablePlanText || plan));
+      preview.addEventListener('click', function () {
+        if (state.running) {
+          return;
+        }
+        state.editingPlanSource = true;
+        renderTimeline();
+      });
+      card.appendChild(preview);
+    }
 
     const row = createActionRow();
+    row.appendChild(createButton(state.editingPlanSource ? 'Preview Plan' : 'Edit Markdown', 'secondary', function () {
+      state.editingPlanSource = !state.editingPlanSource;
+      renderTimeline();
+    }, state.running));
     row.appendChild(createButton('Save Plan', 'secondary', function () {
+      state.editingPlanSource = false;
+      renderTimeline();
       vscode.postMessage({
         type: 'updateWorkflowPlan',
         plan: state.editablePlanText
@@ -848,6 +697,10 @@
     const latestEvaluate = latestEvaluateEvent(events);
 
     events.forEach((event) => {
+      if (event.stage === 'tests') {
+        return;
+      }
+
       const data = event.data || {};
       const code = typeof data.code === 'string' ? data.code.trim() : '';
       const testCode = typeof data.test_code === 'string' ? data.test_code.trim() : '';
@@ -1059,13 +912,13 @@
       ? state.session.resolved_test_code
       : '';
 
-    if (force || sessionChanged || !state.resolvedTestsDirty || incoming === resolvedTestsEditor.value) {
-      resolvedTestsEditor.value = incoming;
+    if (force || sessionChanged || !state.resolvedTestsDirty || incoming === editableCodeText(resolvedTestsEditor)) {
+      setEditableCodeText(resolvedTestsEditor, incoming);
       state.resolvedTestsDirty = false;
     }
 
     state.lastSessionId = activeSessionId;
-    renderResolvedTestsPreview();
+    refreshEditableCodeBlocks();
   }
 
   function syncLayout() {
@@ -1075,6 +928,23 @@
       manualTestsSection.classList.toggle('hidden', showGeneratedTests);
     }
     testsWorkspaceSection.classList.toggle('hidden', !showGeneratedTests);
+  }
+
+  function renderSetupSummaries() {
+    if (modelSummary) {
+      const profile = findProfile(taskProfileSelect.value || state.activeProfileId);
+      const profileName = profile ? profile.name : 'No profile';
+      modelSummary.textContent = profileName + (contextEnabledInput.checked ? ' / context on' : ' / context off');
+    }
+    if (testsSummary) {
+      if (testModeSelect.value === 'generate') {
+        const count = editableCodeText(resolvedTestsEditor).trim().length;
+        testsSummary.textContent = count > 0 ? 'Generated tests selected' : 'Generate tests';
+        return;
+      }
+      const count = editableCodeText(testInput).trim().length;
+      testsSummary.textContent = count > 0 ? 'Manual tests selected' : 'Manual tests';
+    }
   }
 
   function renderComposerStatus() {
@@ -1133,7 +1003,7 @@
     const isGenerateTestMode = testModeSelect.value === 'generate'
       || Boolean(state.session && state.session.test_mode === 'generate');
     const hasProblemDraft = Boolean(problemInput.value.trim());
-    const hasResolvedTestsDraft = Boolean(resolvedTestsEditor.value.trim());
+    const hasResolvedTestsDraft = Boolean(editableCodeText(resolvedTestsEditor).trim());
 
     submitWorkflowBtn.disabled = state.running;
     resumeWorkflowBtn.disabled = state.running || !state.canResume;
@@ -1148,13 +1018,14 @@
     state.resolvedTestsDirty = false;
     state.editablePlanEventId = '';
     state.editablePlanText = '';
+    state.editingPlanSource = false;
     state.lastTimelineSignature = '';
     state.session = null;
     state.lastSessionId = '';
     problemInput.value = '';
-    testInput.value = '';
-    resolvedTestsEditor.value = '';
-    renderResolvedTestsPreview();
+    setEditableCodeText(testInput, '');
+    setEditableCodeText(resolvedTestsEditor, '');
+    refreshEditableCodeBlocks();
     renderAll();
     problemInput.focus();
   }
@@ -1165,6 +1036,7 @@
     renderResolvedTestsHint();
     renderComposerStatus();
     syncLayout();
+    renderSetupSummaries();
     syncActionButtons();
     renderTimeline();
   }
@@ -1200,6 +1072,7 @@
   taskProfileSelect.addEventListener('change', function () {
     const profileId = taskProfileSelect.value;
     state.activeProfileId = profileId;
+    renderSetupSummaries();
     vscode.postMessage({ type: 'switchProfile', profileId });
   });
 
@@ -1216,10 +1089,34 @@
     renderAll();
   });
 
-  resolvedTestsEditor.addEventListener('input', function () {
+  contextEnabledInput.addEventListener('change', function () {
+    renderSetupSummaries();
+  });
+
+  function bindEditableCodeInput(element, onInput) {
+    if (!element) {
+      return;
+    }
+    element.addEventListener('focus', function () {
+      prepareEditableCodeForInput(element);
+    });
+    element.addEventListener('blur', function () {
+      highlightEditableCode(element);
+      renderSetupSummaries();
+    });
+    element.addEventListener('input', onInput);
+  }
+
+  bindEditableCodeInput(testInput, function () {
+    renderSetupSummaries();
+    syncActionButtons();
+  });
+
+  bindEditableCodeInput(resolvedTestsEditor, function () {
     state.resolvedTestsDirty = true;
-    renderResolvedTestsPreview();
+    refreshEditableCodeBlocks();
     renderResolvedTestsHint();
+    renderSetupSummaries();
     syncActionButtons();
   });
 
@@ -1278,6 +1175,7 @@
     state.localLogs = [];
     state.editablePlanEventId = '';
     state.editablePlanText = '';
+    state.editingPlanSource = false;
     vscode.postMessage(Object.assign({ type: 'runWorkflow' }, currentRequestPayload()));
   });
 
@@ -1307,7 +1205,7 @@
     state.resolvedTestsDirty = false;
     vscode.postMessage({
       type: 'updateResolvedTests',
-      resolvedTestCode: resolvedTestsEditor.value
+      resolvedTestCode: editableCodeText(resolvedTestsEditor)
     });
   });
 
@@ -1346,7 +1244,7 @@
         executionModeSelect.value = state.workflowMode;
         if (state.session) {
           problemInput.value = state.session.problem_statement || problemInput.value;
-          testInput.value = state.session.test_text || testInput.value;
+          setEditableCodeText(testInput, state.session.test_text || editableCodeText(testInput));
           testModeSelect.value = state.session.test_mode === 'generate' ? 'generate' : 'manual';
           contextEnabledInput.checked = Boolean(state.session.context_enabled);
         }
@@ -1366,7 +1264,7 @@
         executionModeSelect.value = state.workflowMode;
         if (state.session) {
           problemInput.value = state.session.problem_statement || problemInput.value;
-          testInput.value = state.session.test_text || testInput.value;
+          setEditableCodeText(testInput, state.session.test_text || editableCodeText(testInput));
           testModeSelect.value = state.session.test_mode === 'generate' ? 'generate' : 'manual';
           contextEnabledInput.checked = Boolean(state.session.context_enabled);
         }
@@ -1383,7 +1281,7 @@
         break;
       case 'prefillTestText':
         if (typeof data.testText === 'string') {
-          testInput.value = data.testText;
+          setEditableCodeText(testInput, data.testText);
           renderAll();
         }
         break;
